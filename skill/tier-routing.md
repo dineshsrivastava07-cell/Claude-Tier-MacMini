@@ -13,8 +13,10 @@ description: >
   LiteLLM proxy configs, tier health checks, model routing logic, Qwen Ollama 
   setup, Gemini API integration, Claude subagent orchestration; or patterns like 
   pipeline_code_review, pipeline_debug_chain, or pipeline_build_fullstack. 
-  Enforces strict tier discipline: never skip T1, always attempt local-first, 
-  escalate by quality threshold 0.75.
+  Enforces strict tier discipline (v3.0): SIMPLE tasks ALWAYS route to T1-LOCAL
+  (zero exceptions, zero T3 fallthrough — critical bug patched in v3.0); T3 is
+  EPIC-only last resort; complexity classification runs before task-type analysis;
+  never skip T1, always attempt local-first, escalate by quality threshold 0.75.
 ---
 
 # Tier Routing AI Orchestration Skill

@@ -145,3 +145,70 @@ INTEGRATION=true npx vitest run tests/integration/   # Integration tests (requir
 | FULLSTACK | T1-LOCAL | T2-PRO | T3 | T3 |
 | REFACTOR | T1-LOCAL | T1-CLOUD | T1-CLOUD | T3 |
 | INTEGRATION | T1-LOCAL | T2-PRO | T2-PRO | T3 |
+
+## System Prompt v3.0 — Strict Tier Routing Enforcement
+
+The `prompts/` directory contains the Claude CLI system prompt that enforces strict tier routing on every session.
+
+### v3.0 Critical Bug Fix
+
+| | Before v3.0 | After v3.0 |
+|---|---|---|
+| SIMPLE + unmapped task type | → T3 (fallthrough) ❌ | → T1-LOCAL (correct) ✅ |
+| "connect to project" | → INTEGRATION → T3 ❌ | → ls+git = SIMPLE → T1-LOCAL ✅ |
+| "explore directory" | → INTEGRATION → T3 ❌ | → ls = SIMPLE → T1-LOCAL ✅ |
+| T3 usage | Catch-all default ❌ | EPIC only ✅ |
+
+### v3.0 Routing Rules
+
+```
+STRICT ROUTING DECISION ENGINE (3 steps, always in order):
+
+  Step 1 — COMPLEXITY CHECK (runs FIRST, before task-type):
+    SIMPLE?  → T1-LOCAL. STOP. No further analysis.
+    Not simple? → continue to Step 2.
+
+  Step 2 — ROUTING MATRIX:
+    SIMPLE   + ANY type   → T1-LOCAL  (all task types, no exceptions)
+    MODERATE + ANY type   → T1-CLOUD
+    COMPLEX  + analytics/arch/security → T2-PRO
+    COMPLEX  + debug/codegen/other     → T2-FLASH
+    EPIC     + ANY type   → T3
+
+  Step 3 — ROUTING PROTOCOL:
+    [3-A] Complexity check → [3-B] Task-type detect → [3-C] Tier assign
+    [3-D] Health verify   → [3-E] Execute + quality score
+
+FALLBACK CHAIN: T1-LOCAL → T1-CLOUD → T2-FLASH → T3 (quality gate 0.75)
+ANTI-PATTERN:   "When in doubt" → classify DOWN (SIMPLE), never UP (EPIC)
+```
+
+### Shell/Explore Remapping (always SIMPLE → T1-LOCAL)
+
+| User says | Real operation | Tier |
+|---|---|---|
+| "connect to project" | `ls + git log` | T1-LOCAL |
+| "explore directory" | `ls -la` | T1-LOCAL |
+| "check git history" | `git log` | T1-LOCAL |
+| "what's in this file" | `cat` | T1-LOCAL |
+| "inspect project" | `ls + git status` | T1-LOCAL |
+
+### Installation
+
+```bash
+# Copy system prompt to Claude CLI config
+cp prompts/system-prompt-v3.md ~/.claude/tier-routing.md
+
+# It is injected automatically via the claude() shell function in ~/.zshrc:
+# claude() {
+#   "$CLAUDE_BINARY" --append-system-prompt "$(cat ~/.claude/tier-routing.md)" "$@"
+# }
+```
+
+### Prompt Files
+
+| File | Purpose |
+|---|---|
+| `prompts/system-prompt-v3.md` | **Active** — merged v3.0 system prompt (install to `~/.claude/tier-routing.md`) |
+| `prompts/specs/strict-routing-v3-spec.md` | Strict enforcement spec (v3.0 source) |
+| `prompts/specs/base-routing-prompt-v2.md` | Base routing prompt (v2.0 source) |
