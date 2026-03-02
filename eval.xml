@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<evaluation name="tier-router-mcp QA" version="1.0.0">
+
+  <testCase id="1" tier="T1-LOCAL" expectedComplexity="SIMPLE">
+    <prompt>Rename variable x to count in: let x = 0;</prompt>
+    <expectedTaskType>CODE_GENERATION</expectedTaskType>
+    <qualityThreshold>0.6</qualityThreshold>
+    <maxLatencyMs>5000</maxLatencyMs>
+  </testCase>
+
+  <testCase id="2" tier="T1-LOCAL" expectedComplexity="SIMPLE">
+    <prompt>Write a Python function that checks if a number is even</prompt>
+    <expectedTaskType>CODE_GENERATION</expectedTaskType>
+    <qualityThreshold>0.7</qualityThreshold>
+    <maxLatencyMs>10000</maxLatencyMs>
+  </testCase>
+
+  <testCase id="3" tier="T1-CLOUD" expectedComplexity="MODERATE">
+    <prompt>Implement a TypeScript class for an LRU cache with get and set operations</prompt>
+    <expectedTaskType>CODE_GENERATION</expectedTaskType>
+    <qualityThreshold>0.75</qualityThreshold>
+    <maxLatencyMs>60000</maxLatencyMs>
+  </testCase>
+
+  <testCase id="4" tier="T1-CLOUD" expectedComplexity="MODERATE">
+    <prompt>Review this Express.js middleware for security vulnerabilities: app.get('/user/:id', (req, res) => { db.query('SELECT * FROM users WHERE id=' + req.params.id) })</prompt>
+    <expectedTaskType>CODE_REVIEW</expectedTaskType>
+    <qualityThreshold>0.75</qualityThreshold>
+    <maxLatencyMs>60000</maxLatencyMs>
+  </testCase>
+
+  <testCase id="5" tier="T2-FLASH" expectedComplexity="MODERATE">
+    <prompt>Fix this async bug: async function fetchData() { const data = fetch('/api/data'); return data.json(); }</prompt>
+    <expectedTaskType>DEBUGGING</expectedTaskType>
+    <qualityThreshold>0.75</qualityThreshold>
+    <maxLatencyMs>30000</maxLatencyMs>
+  </testCase>
+
+  <testCase id="6" tier="T2-FLASH" expectedComplexity="COMPLEX">
+    <prompt>Write comprehensive unit tests for a JWT authentication service with refresh token rotation in TypeScript using Vitest</prompt>
+    <expectedTaskType>TESTING</expectedTaskType>
+    <qualityThreshold>0.75</qualityThreshold>
+    <maxLatencyMs>60000</maxLatencyMs>
+  </testCase>
+
+  <testCase id="7" tier="T2-PRO" expectedComplexity="COMPLEX">
+    <prompt>Analyse and explain the trade-offs between CQRS+Event Sourcing vs traditional CRUD for a high-throughput e-commerce order management system processing 10,000 orders/minute</prompt>
+    <expectedTaskType>ARCHITECTURE</expectedTaskType>
+    <qualityThreshold>0.8</qualityThreshold>
+    <maxLatencyMs>120000</maxLatencyMs>
+  </testCase>
+
+  <testCase id="8" tier="T3" expectedComplexity="EPIC">
+    <prompt>Design and implement a complete production-ready multi-tenant SaaS authentication system with: JWT + refresh token rotation, OAuth2 (Google/GitHub), MFA (TOTP), rate limiting, session management, audit logging, RBAC, and comprehensive test suite in TypeScript/Node.js</prompt>
+    <expectedTaskType>ARCHITECTURE</expectedTaskType>
+    <qualityThreshold>0.85</qualityThreshold>
+    <maxLatencyMs>180000</maxLatencyMs>
+  </testCase>
+
+  <testCase id="9" tier="T1-CLOUD" expectedComplexity="MODERATE">
+    <prompt>Generate JSDoc documentation for: function debounce(fn, delay) { let timer; return (...args) => { clearTimeout(timer); timer = setTimeout(() => fn(...args), delay); }; }</prompt>
+    <expectedTaskType>DOCUMENTATION</expectedTaskType>
+    <qualityThreshold>0.7</qualityThreshold>
+    <maxLatencyMs>30000</maxLatencyMs>
+  </testCase>
+
+  <testCase id="10" tier="T2-FLASH" expectedComplexity="MODERATE">
+    <prompt>Analyse the following sales data array and identify top 3 revenue drivers: [{category: "Electronics", revenue: 450000}, {category: "Clothing", revenue: 230000}, {category: "Food", revenue: 180000}, {category: "Sports", revenue: 320000}, {category: "Home", revenue: 290000}]</prompt>
+    <expectedTaskType>DATA_ANALYSIS</expectedTaskType>
+    <qualityThreshold>0.75</qualityThreshold>
+    <maxLatencyMs>30000</maxLatencyMs>
+  </testCase>
+
+</evaluation>

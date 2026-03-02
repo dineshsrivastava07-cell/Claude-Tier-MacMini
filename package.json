@@ -1,0 +1,31 @@
+{
+  "name": "tier-router-mcp",
+  "version": "1.0.0",
+  "description": "MCP Server — 4-Tier AI routing: T1-LOCAL(qwen2.5-coder:7b) → T1-CLOUD(qwen3-coder:480b) → T2(Gemini) → T3(Claude)",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build":    "tsc",
+    "dev":      "tsc --watch",
+    "start":    "node dist/index.js",
+    "start:http": "HTTP_PORT=3100 node dist/index.js",
+    "test":     "node --experimental-vm-modules node_modules/.bin/jest",
+    "inspect":  "npx @modelcontextprotocol/inspector dist/index.js",
+    "clean":    "rm -rf dist"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@anthropic-ai/sdk":        "^0.36.3",
+    "@google/generative-ai":    "^0.21.0",
+    "express":                  "^4.18.2",
+    "zod":                      "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node":    "^22.0.0",
+    "jest":           "^29.7.0",
+    "ts-jest":        "^29.2.5",
+    "typescript":     "^5.7.3"
+  },
+  "engines": { "node": ">=18.0.0" }
+}

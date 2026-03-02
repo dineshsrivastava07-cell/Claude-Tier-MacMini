@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "tier-router": {
+      "command": "node",
+      "args": ["/Users/dsr-ai-lab/tier-router-mcp/dist/index.js"],
+      "env": {
+        "OLLAMA_LOCAL_HOST": "http://localhost:11434",
+        "CLAUDE_MODEL": "claude-sonnet-4-6",
+        "QUALITY_THRESHOLD": "0.75",
+        "T1_LOCAL_TIMEOUT_MS": "90000",
+        "T1_CLOUD_TIMEOUT_MS": "300000",
+        "T2_TIMEOUT_MS": "60000",
+        "T3_TIMEOUT_MS": "120000"
+      }
+    }
+  }
+}

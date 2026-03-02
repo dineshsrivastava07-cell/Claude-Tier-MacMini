@@ -1,0 +1,15 @@
+services:
+  tier-router-mcp:
+    build: .
+    environment:
+      OLLAMA_LOCAL_HOST: http://host.docker.internal:11434
+      QUALITY_THRESHOLD: "0.75"
+      T1_LOCAL_TIMEOUT_MS: "90000"
+      T1_CLOUD_TIMEOUT_MS: "300000"
+      T2_TIMEOUT_MS: "60000"
+      T3_TIMEOUT_MS: "120000"
+      # GEMINI_API_KEY: ${GEMINI_API_KEY}
+      # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
