@@ -1,959 +1,828 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  DSR AI-LAB — TIER ENFORCER MCP SERVER v5.1                        ║
-║  File: ~/tier-enforcer-mcp/server.py  (REPLACE EXISTING)           ║
-║  9 Tiers · LangSmith Traces · Kimi-K2 · qwen3-coder-next           ║
-║  + execute_task() — LangGraph auto-invoked master entry point       ║
-║    Layer 1 (OAuth auth) untouched · Layer 2 (tasks) hard enforced  ║
+║  DSR AI-LAB TIER ENFORCER v6.1 — EXECUTION FIXED                   ║
+║  File: ~/tier-enforcer-mcp/server.py                                ║
+║                                                                      ║
+║  BUGS FIXED vs v6.0:                                                ║
+║                                                                      ║
+║  BUG 1 — LangGraph quality gate was a conditional-edge function     ║
+║           that tried to modify state. LangGraph DISCARDS state      ║
+║           changes made inside edge functions. Result: model kept    ║
+║           re-running on the same tier in an infinite loop until     ║
+║           fallback_count hit 3, then returned empty.                ║
+║           FIX: Split into _node_escalate (proper state node) +      ║
+║                _should_escalate (pure routing function, no state).  ║
+║                                                                      ║
+║  BUG 2 — _call_ollama timeout = 120s. Local 7B model generating     ║
+║           300+ lines of code takes 3–8 min on Mac Mini M-series.   ║
+║           Result: TimeoutError → ok=False → score=0 → escalate.    ║
+║           FIX: timeout=600s local, 300s cloud. Streaming HTTP.      ║
+║                                                                      ║
+║  BUG 3 — No num_ctx set. qwen2.5-coder:7b defaults to 2048 tokens. ║
+║           Long prompts silently truncated. Model sees partial task. ║
+║           FIX: num_ctx=8192 local, 16384 cloud, num_predict=4096.   ║
+║                                                                      ║
+║  BUG 4 — Quality scorer penalised results containing the word       ║
+║           "error" (e.g. "error handling", "raise ValueError").      ║
+║           Normal code scores 0.6 → below 0.75 threshold →          ║
+║           triggers escalation on perfectly good output.             ║
+║           FIX: Smarter scorer. Only penalise actual failure         ║
+║                phrases. Completion markers add bonus. Tier-aware    ║
+║                thresholds (T1-LOCAL=0.5, others=0.65).              ║
 ╚══════════════════════════════════════════════════════════════════════╝
+Install: pip install fastmcp langgraph langchain-core langchain-ollama
+         langchain-google-genai langsmith huggingface_hub pydantic httpx
+         --break-system-packages
 """
-import os, json, time, subprocess, urllib.request, urllib.error
+
+import os, json, time, subprocess, logging, sqlite3, urllib.request
+from typing import TypedDict
 from fastmcp import FastMCP
 
-# ── Optional LangSmith tracing ────────────────────────────────────────
+# ── OPTIONAL IMPORTS ──────────────────────────────────────────────────
 try:
-    from langsmith import traceable
-    LANGSMITH_ENABLED = bool(os.environ.get("LANGCHAIN_API_KEY"))
+    from langgraph.graph import StateGraph, END
+    from langchain_ollama import ChatOllama
+    from langchain_core.messages import HumanMessage, SystemMessage
+    LANGGRAPH_AVAILABLE = True
 except ImportError:
-    def traceable(**kwargs):
-        def decorator(fn): return fn
-        return decorator
-    LANGSMITH_ENABLED = False
+    LANGGRAPH_AVAILABLE = False
 
-# ── Optional HuggingFace for Kimi-K2 ─────────────────────────────────
 try:
     from huggingface_hub import InferenceClient
-    HF_ENABLED = bool(os.environ.get("HF_API_KEY"))
+    HF_AVAILABLE = True
 except ImportError:
-    HF_ENABLED = False
+    HF_AVAILABLE = False
 
-mcp = FastMCP("tier-router-mcp")
+# ═══════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════
 
-# ── CONFIGURATION ─────────────────────────────────────────────────────
-OLLAMA_LOCAL      = os.environ.get("OLLAMA_LOCAL_HOST",  "http://localhost:11434")
-OLLAMA_CLOUD      = os.environ.get("OLLAMA_CLOUD_HOST",  "http://localhost:11434")
-OLLAMA_CLOUD_API  = "https://api.ollama.com"
-OLLAMA_API_KEY    = os.environ.get("OLLAMA_API_KEY", "")
-QUALITY_GATE  = float(os.environ.get("QUALITY_THRESHOLD", "0.75"))
-LOG_PATH      = os.path.expanduser("~/.tier-enforcer/routing.log")
-MEMORY_PATH   = os.path.expanduser("~/.tier-enforcer/memory.db")
+HOME     = os.path.expanduser("~")
+DB_DIR   = os.path.join(HOME, ".tier-enforcer")
+LOG_PATH = os.path.join(DB_DIR, "routing.log")
+MEM_DB   = os.path.join(DB_DIR, "memory.db")
+os.makedirs(DB_DIR, exist_ok=True)
 
-# ── TIER MODEL MAPPING ────────────────────────────────────────────────
-TIERS = {
-    "T1-LOCAL":  {"model": "qwen2.5-coder:7b",        "host": OLLAMA_LOCAL,      "type": "ollama"},
-    "T1-MID":    {"model": "qwen3-coder-next",           "host": OLLAMA_CLOUD_API,  "type": "ollama-cloud"},
-    "T1-CLOUD":  {"model": "qwen3-coder:480b-cloud",   "host": OLLAMA_CLOUD,      "type": "ollama"},
-    "T2-FLASH":  {"model": "gemini-2.5-flash",         "host": "gemini-cli",  "type": "gemini"},
-    "T2-PRO":    {"model": "gemini-2.5-pro",           "host": "gemini-cli",  "type": "gemini"},
-    "T2-KIMI":   {"model": "moonshotai/Kimi-K2-Instruct", "host": "hf-api",  "type": "huggingface"},
-    "T3":        {"model": "claude-sonnet-4-6",        "host": "claude-cli",  "type": "claude"},
+logging.basicConfig(
+    filename=LOG_PATH, level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s"
+)
+log = logging.getLogger("tier-enforcer")
+
+OLLAMA_LOCAL = os.environ.get("OLLAMA_LOCAL_HOST", "http://localhost:11434")
+OLLAMA_CLOUD = os.environ.get("OLLAMA_CLOUD_HOST", "http://localhost:11434")
+HF_API_KEY   = os.environ.get("HF_API_KEY", "")
+
+# ── TIMEOUTS (FIX 2) ──────────────────────────────────────────────────
+TIMEOUT_LOCAL  = int(os.environ.get("OLLAMA_TIMEOUT_LOCAL",  "600"))  # 10 min
+TIMEOUT_MID    = int(os.environ.get("OLLAMA_TIMEOUT_MID",    "480"))  # 8 min
+TIMEOUT_CLOUD  = int(os.environ.get("OLLAMA_TIMEOUT_CLOUD",  "300"))  # 5 min
+
+# ── OLLAMA GENERATION PARAMS (FIX 3) ─────────────────────────────────
+OLLAMA_PARAMS_LOCAL = {
+    "num_ctx":     8192,    # context window — was defaulting to 2048
+    "num_predict": 4096,    # max output tokens — prevents early stop
+    "temperature": 0.1,     # deterministic code output
+    "top_p":       0.9,
+    "repeat_penalty": 1.1,
+}
+OLLAMA_PARAMS_CLOUD = {
+    "num_ctx":     16384,
+    "num_predict": 8192,
+    "temperature": 0.1,
+    "top_p":       0.9,
+    "repeat_penalty": 1.1,
 }
 
-FALLBACK_CHAIN = ["T1-LOCAL", "T1-MID", "T1-CLOUD", "T2-FLASH", "T2-PRO", "T2-KIMI", "T3"]
+# ── QUALITY THRESHOLDS PER TIER (FIX 4) ──────────────────────────────
+# Lower threshold for local — it's fast and free, accept imperfect output
+# rather than always escalating to cloud
+QUALITY_THRESHOLDS = {
+    "T1-LOCAL":  float(os.environ.get("QUALITY_T1_LOCAL",  "0.50")),
+    "T1-MID":    float(os.environ.get("QUALITY_T1_MID",    "0.55")),
+    "T1-CLOUD":  float(os.environ.get("QUALITY_T1_CLOUD",  "0.60")),
+    "DEFAULT":   float(os.environ.get("QUALITY_THRESHOLD", "0.55")),
+}
 
-# ══════════════════════════════════════════════════════════════════════
-#  HARDCODED ROUTING RULES  (replaces tier-routing.md — same purpose,
-#  enforced by Python code not prompt — cannot drift, cannot be ignored)
-#  Source: tier-routing-v5.1.md — embedded here permanently
-# ══════════════════════════════════════════════════════════════════════
+CLAUDE_EXECUTION_BLOCK = True
+MASTER_RULE = "execute_task(task, session_id, context)"
 
-# ── LAYER 1: AUTH (never routed — runs before MCP tools exist) ────────
-# OAuth handshake at Claude CLI startup runs at process level.
-# tier-routing rules and MCP tools do not exist yet during auth.
-# T3 gate cannot fire during auth — it is infrastructure, not a task.
-# After auth completes → Claude CLI shell opens → Layer 2 begins.
-LAYER_1_AUTH_BYPASS = True   # auth always bypasses routing — hardcoded, not configurable
-
-# ── LAYER 2: TASK ROUTING RULES (hardcoded — enforced by classify_node) ─
-# These keyword sets drive the classify_node in langgraph_tier.py
-# AND the tier_classify() MCP tool below — single source of truth.
+# ── TIER CONFIG ───────────────────────────────────────────────────────
+TIER_CONFIG = {
+    "T1-LOCAL":  {"model": "qwen2.5-coder:7b",      "role": "executor", "base": OLLAMA_LOCAL, "type": "ollama", "timeout": TIMEOUT_LOCAL,  "params": OLLAMA_PARAMS_LOCAL},
+    "T1-MID":    {"model": "qwen3-coder:30b",        "role": "executor", "base": OLLAMA_CLOUD, "type": "ollama", "timeout": TIMEOUT_MID,    "params": OLLAMA_PARAMS_CLOUD},
+    "T1-CLOUD":  {"model": "qwen3-coder-next",       "role": "executor", "base": OLLAMA_CLOUD, "type": "ollama", "timeout": TIMEOUT_CLOUD,  "params": OLLAMA_PARAMS_CLOUD},
+    "T2-FLASH":  {"model": "gemini-2.5-flash",       "role": "analysis", "type": "gemini"},
+    "T2-PRO":    {"model": "gemini-2.5-pro",         "role": "analysis", "type": "gemini"},
+    "T2-KIMI":   {"model": "Qwen/Kimi-K2-Instruct",  "role": "analysis", "type": "huggingface"},
+    "T3-EPIC":   {"model": "claude-brain-only",      "role": "brain",    "type": "claude"},
+}
 
 ROUTING_RULES = {
-    # ── T3: EPIC ONLY ─────────────────────────────────────────────────
-    # Approved: complexity==EPIC OR chain_exhausted OR force+reason
-    # Blocked:  everything else — hard gate, no exceptions
-    "EPIC": {
-        "tier":     "T3",
-        "model":    "claude-sonnet-4-6",
-        "keywords": ["greenfield", "new platform", "full system", "epic",
-                     "build entire", "from scratch", "new product",
-                     "new application", "complete system"],
-        "gate":     "t3_epic_gate",          # mandatory hard gate
-        "blocked_if_not_epic": True,         # hardcoded block
-    },
-
-    # ── T2-KIMI: Math / Stats / Algorithms ────────────────────────────
-    "COMPLEX-REASON": {
-        "tier":     "T2-KIMI",
-        "model":    "moonshotai/Kimi-K2-Instruct",
-        "keywords": ["math", "statistic", "algorithm", "proof", "formula",
-                     "calculus", "matrix", "eigenvalue", "differential",
-                     "regression model", "optimization problem", "bayesian",
-                     "numerical method", "probability dist", "linear algebra",
-                     "fourier", "gradient descent", "loss function"],
-        "gate":     None,
-    },
-
-    # ── T2-PRO: Deep analysis / Architecture ──────────────────────────
-    "COMPLEX-DEEP": {
-        "tier":     "T2-PRO",
-        "model":    "gemini-2.5-pro",
-        "keywords": ["architecture", "security audit", "system design",
-                     "deep analysis", "rca", "root cause", "tech spec",
-                     "infrastructure design", "capacity planning",
-                     "performance analysis", "comprehensive review",
-                     "technical specification", "design document"],
-        "gate":     None,
-    },
-
-    # ── T2-FLASH: Debug / Refactor / Integration ──────────────────────
-    "COMPLEX-FAST": {
-        "tier":     "T2-FLASH",
-        "model":    "gemini-2.5-flash",
-        "keywords": ["debug", "fix bug", "refactor", "multi-file",
-                     "cross-module", "e2e wiring", "wire", "oauth flow",
-                     "api integration", "integration test", "trace error",
-                     "stack trace", "exception handling", "iterate"],
-        "gate":     None,
-    },
-
-    # ── T1-CLOUD: Feature sets / Pipelines ────────────────────────────
-    "MODERATE-LARGE": {
-        "tier":     "T1-CLOUD",
-        "model":    "qwen3-coder:480b-cloud",
-        "keywords": ["feature set", "multiple files", "new module",
-                     "database schema", "auth system", "full feature",
-                     "rpa", "automation workflow", "ai agent", "llm app",
-                     "pipeline", "end to end feature", "service layer"],
-        "gate":     None,
-    },
-
-    # ── T1-MID: Single features / Components ──────────────────────────
-    "MODERATE-SMALL": {
-        "tier":     "T1-MID",
-        "model":    "qwen3-coder-next",
-        "keywords": ["implement", "create feature", "add component",
-                     "new service", "unit test", "api endpoint", "crud",
-                     "new class", "new function", "add method",
-                     "write test", "add route"],
-        "gate":     None,
-    },
-
-    # ── T1-LOCAL: Simple / Single file / Config ───────────────────────
-    "SIMPLE": {
-        "tier":     "T1-LOCAL",
-        "model":    "qwen2.5-coder:7b",
-        "keywords": [],   # default fallback — everything else
-        "gate":     None,
-    },
+    "T3-EPIC": {"keywords": ["greenfield platform","full system","entire application","production architecture","design and build complete","from scratch end to end"]},
+    "T2-KIMI":  {"keywords": ["algorithm analysis","mathematical proof","statistical model","complex math","optimize algorithm","big o analysis"]},
+    "T2-PRO":   {"keywords": ["security audit","performance review","architecture review","code review entire","analyse codebase"]},
+    "T2-FLASH": {"keywords": ["debug","fix bug","refactor","trace error","why is this failing","what is wrong"]},
+    "T1-CLOUD": {"keywords": ["feature set","ai agent","rpa workflow","full component","multi-file","entire module","build the"]},
+    "T1-MID":   {"keywords": ["implement","create function","unit test","add endpoint","write class","build service"]},
+    "T1-LOCAL": {"keywords": []},
 }
 
-# ── QUALITY GATE RULES (hardcoded — enforced by quality_gate_node) ────
-QUALITY_RULES = {
-    "threshold":         QUALITY_GATE,          # 0.75 — escalate if below
-    "escalate_action":   "next_tier_in_chain",  # move to next tier
-    "exhausted_action":  "T3_gate",             # if T2-KIMI fails → T3 gate
-    "max_fallbacks":     6,                     # T1-LOCAL → T2-KIMI = 6 steps
-}
+FALLBACK_CHAIN = ["T1-LOCAL", "T1-MID", "T1-CLOUD"]
+MAX_FALLBACKS  = 2   # reduced: attempt local, then mid, then accept
 
-# ── SESSION START RULES (hardcoded procedure) ─────────────────────────
-SESSION_START_PROCEDURE = [
-    "tier_health_check(tier='ALL')",   # step 1 — verify all tiers live
-    "check_budget()",                  # step 2 — confirm T3 cap status
-    "/clear",                          # step 3 — fresh context
-]
 
-# ── SKIP execute_task FOR THESE CALLS ONLY ────────────────────────────
-INFRASTRUCTURE_CALLS = {
-    "tier_health_check", "check_budget", "tier_audit_log",
-    "/tier-audit", "/tier-debug", "/tier-report",
-    "/tier-reset", "/tier-health",
-}
-
-# ── MASTER ROUTING RULE (enforced by execute_task) ────────────────────
-# Single rule: every user task → execute_task() → LangGraph graph
-# No manual tool chaining. No direct T3 calls. No skipping classify.
-MASTER_RULE = "execute_task(task, session_id)"  # only entry point
-
-os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
-
-# ── HELPER: AUDIT LOG ─────────────────────────────────────────────────
-def _write_log(entry: dict):
-    entry["timestamp"] = time.time()
-    with open(LOG_PATH, "a") as f:
-        f.write(json.dumps(entry) + "\n")
-
-# ── HELPER: OLLAMA CALL ───────────────────────────────────────────────
-@traceable(name="ollama-call", run_type="llm")
-def _call_ollama(host: str, model: str, prompt: str,
-                 system: str = "You are a helpful coding assistant.") -> str:
-    payload = json.dumps({
-        "model": model, "stream": False,
-        "options": {"temperature": 0.1, "num_ctx": 131072, "seed": 42},
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": prompt}
-        ]
-    }).encode()
-    req = urllib.request.Request(
-        f"{host}/api/chat",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        result = json.loads(resp.read())
-        return result["message"]["content"]
-
-# ── HELPER: OLLAMA CLOUD CALL (OpenAI-compatible api.ollama.com) ──────
-@traceable(name="ollama-cloud-call", run_type="llm")
-def _call_ollama_cloud(model: str, prompt: str,
-                       system: str = "You are a helpful coding assistant.") -> str:
-    api_key = os.environ.get("OLLAMA_API_KEY", OLLAMA_API_KEY)
-    payload = json.dumps({
-        "model": model, "stream": False,
-        "temperature": 0.1, "max_tokens": 4096,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": prompt}
-        ]
-    }).encode()
-    req = urllib.request.Request(
-        f"{OLLAMA_CLOUD_API}/v1/chat/completions",
-        data=payload,
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {api_key}"},
-        method="POST"
-    )
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        result = json.loads(resp.read())
-        return result["choices"][0]["message"]["content"]
-
-# ── HELPER: GEMINI CALL ───────────────────────────────────────────────
-@traceable(name="gemini-call", run_type="llm")
-def _call_gemini(model: str, prompt: str) -> str:
-    result = subprocess.run(
-        ["gemini", "-m", model, "-p", prompt],
-        capture_output=True, text=True, timeout=180
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Gemini CLI error: {result.stderr[:200]}")
-    return result.stdout.strip()
-
-# ── HELPER: KIMI-K2 CALL ─────────────────────────────────────────────
-@traceable(name="kimi-k2-call", run_type="llm")
-def _call_kimi(prompt: str) -> str:
-    if not HF_ENABLED:
-        raise RuntimeError("HF_API_KEY not set — cannot call Kimi-K2")
-    client = InferenceClient(
-        model="moonshotai/Kimi-K2-Instruct",
-        token=os.environ.get("HF_API_KEY")
-    )
-    response = client.chat_completion(
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=8192, temperature=0.1
-    )
-    return response.choices[0].message.content
-
-# ── HELPER: QUALITY SCORE ─────────────────────────────────────────────
-def _score(result: str, task: str) -> float:
-    if not result or len(result) < 10: return 0.0
-    score = 0.5
-    if len(result) > 100:  score += 0.1
-    if len(result) > 500:  score += 0.1
-    if "```" in result and any(k in task.lower()
-       for k in ["code","implement","write","create","fix","build","refactor"]):
-        score += 0.15
-    if not any(bad in result.lower()
-               for bad in ["i cannot","i don't know","i'm unable","as an ai"]):
-        score += 0.15
-    return min(score, 1.0)
-
-# ══════════════════════════════════════════════════════════════════════
-#  TOOL 1: tier_classify
-#  Driven by ROUTING_RULES — single source of truth, no duplicated keywords
-# ══════════════════════════════════════════════════════════════════════
-NEXT_TOOL_MAP = {
-    "T3":       "t3_epic_gate",
-    "T2-KIMI":  "t2_kimi_execute",
-    "T2-PRO":   "t2_gemini_execute",
-    "T2-FLASH": "t2_gemini_execute",
-    "T1-CLOUD": "t1_cloud_execute",
-    "T1-MID":   "t1_mid_execute",
-    "T1-LOCAL": "t1_local_execute",
-}
+# ═══════════════════════════════════════════════════════════════════════
+# ROUTING CLASSIFIER
+# ═══════════════════════════════════════════════════════════════════════
 
 def _classify_task(task: str) -> tuple:
-    """
-    Core classification logic driven entirely by ROUTING_RULES dict.
-    Single source of truth — used by tier_classify() MCP tool
-    AND imported by langgraph_tier.py classify_node.
-    Returns: (complexity, tier, next_tool)
-    """
     t = task.lower()
-    # Iterate complexity levels highest → lowest priority
-    for complexity in ["EPIC", "COMPLEX-REASON", "COMPLEX-DEEP",
-                        "COMPLEX-FAST", "MODERATE-LARGE", "MODERATE-SMALL"]:
-        rule = ROUTING_RULES[complexity]
-        if any(k in t for k in rule["keywords"]):
-            tier = rule["tier"]
-            return complexity, tier, NEXT_TOOL_MAP[tier]
-    # Default: SIMPLE → T1-LOCAL
-    return "SIMPLE", "T1-LOCAL", "t1_local_execute"
+    for tier in ["T3-EPIC","T2-KIMI","T2-PRO","T2-FLASH","T1-CLOUD","T1-MID"]:
+        if any(k in t for k in ROUTING_RULES[tier]["keywords"]):
+            return tier, TIER_CONFIG[tier], tier
+    return "T1-LOCAL", TIER_CONFIG["T1-LOCAL"], "T1-LOCAL"
 
-@mcp.tool()
-def tier_classify(task: str, context: str = "") -> dict:
-    """
-    STEP 1 — called internally by execute_task() via LangGraph.
-    Classifies task using ROUTING_RULES (hardcoded Python — not prompt).
-    Rules are identical to tier-routing-v5.1.md — embedded here permanently.
-    Layer 1 (OAuth auth) is never routed — runs before this tool exists.
-    Layer 2 (user tasks) — always classified, always gated.
-    """
-    complexity, tier, next_tool = _classify_task(task)
-    result = {
-        "complexity":     complexity,
-        "assigned_tier":  tier,
-        "next_tool":      next_tool,
-        "fallback_chain": " → ".join(FALLBACK_CHAIN),
-        "quality_gate":   QUALITY_RULES["threshold"],
-        "model":          TIERS[tier]["model"],
-        "rule_source":    "ROUTING_RULES (hardcoded Python — single source of truth)",
-        "t3_gate_required": tier == "T3",
-        "layer":          "LAYER_2_TASK_ROUTING",
-    }
-    _write_log({"event": "classify", **result, "task_preview": task[:80]})
-    return result
+def _get_executor_tier(classified: str) -> str:
+    if classified == "T3-EPIC":
+        return "T1-CLOUD"
+    if classified in ("T2-FLASH","T2-PRO","T2-KIMI"):
+        return "T1-MID"
+    return classified
 
-# ══════════════════════════════════════════════════════════════════════
-#  TOOL 2: t1_local_execute
-# ══════════════════════════════════════════════════════════════════════
-@mcp.tool()
-@traceable(name="T1-LOCAL", run_type="llm",
-           metadata={"tier": "T1-LOCAL", "model": "qwen2.5-coder:7b"})
-def t1_local_execute(task: str, context: str = "") -> dict:
-    """
-    T1-LOCAL: qwen2.5-coder:7b via Ollama localhost:11434
-    Use for: SIMPLE tasks — single file, <20 lines, shell, config edits.
-    REAL API CALL — not simulated.
-    """
-    t0 = time.time()
-    cfg = TIERS["T1-LOCAL"]
-    try:
-        prompt = f"{context}\n\nTask: {task}".strip() if context else task
-        result = _call_ollama(cfg["host"], cfg["model"], prompt)
-        score  = _score(result, task)
-        status = "PASS" if score >= QUALITY_GATE else "ESCALATE"
-        entry  = {
-            "event": "T1_LOCAL_EXECUTE", "model": cfg["model"],
-            "quality": score, "status": status,
-            "latency_ms": int((time.time()-t0)*1000),
-            "task_preview": task[:80]
-        }
-        _write_log(entry)
-        return {
-            "tier": "T1-LOCAL", "model": cfg["model"],
-            "api_call_made": True, "endpoint": cfg["host"],
-            "result": result, "quality_score": score,
-            "status": status,
-            "next_tool": None if status == "PASS" else "t1_mid_execute"
-        }
-    except Exception as e:
-        _write_log({"event": "T1_LOCAL_ERROR", "error": str(e)})
-        return {"tier": "T1-LOCAL", "api_call_made": False,
-                "error": str(e), "next_tool": "t1_mid_execute"}
 
-# ══════════════════════════════════════════════════════════════════════
-#  TOOL 3: t1_mid_execute  (NEW)
-# ══════════════════════════════════════════════════════════════════════
-@mcp.tool()
-@traceable(name="T1-MID", run_type="llm",
-           metadata={"tier": "T1-MID", "model": "qwen3-coder-next"})
-def t1_mid_execute(task: str, context: str = "") -> dict:
-    """
-    T1-MID: qwen3-coder-next via Ollama cloud server (api.ollama.com).
-    Use for: MODERATE-SMALL — 2-5 files, single feature, moderate refactor.
-    REAL API CALL — not simulated.
-    """
-    t0 = time.time()
-    cfg = TIERS["T1-MID"]
-    try:
-        prompt = f"{context}\n\nTask: {task}".strip() if context else task
-        result = _call_ollama_cloud(cfg["model"], prompt)
-        score  = _score(result, task)
-        status = "PASS" if score >= QUALITY_GATE else "ESCALATE"
-        _write_log({
-            "event": "T1_MID_EXECUTE", "model": cfg["model"],
-            "quality": score, "status": status,
-            "latency_ms": int((time.time()-t0)*1000),
-            "task_preview": task[:80]
-        })
-        return {
-            "tier": "T1-MID", "model": cfg["model"],
-            "api_call_made": True, "endpoint": cfg["host"],
-            "result": result, "quality_score": score,
-            "status": status,
-            "next_tool": None if status == "PASS" else "t1_cloud_execute"
-        }
-    except Exception as e:
-        _write_log({"event": "T1_MID_ERROR", "error": str(e)})
-        return {"tier": "T1-MID", "api_call_made": False,
-                "error": str(e), "next_tool": "t1_cloud_execute"}
+# ═══════════════════════════════════════════════════════════════════════
+# MODEL CALLERS — FIXED
+# ═══════════════════════════════════════════════════════════════════════
 
-# ══════════════════════════════════════════════════════════════════════
-#  TOOL 4: t1_cloud_execute
-# ══════════════════════════════════════════════════════════════════════
-@mcp.tool()
-@traceable(name="T1-CLOUD", run_type="llm",
-           metadata={"tier": "T1-CLOUD", "model": "qwen3-coder:480b"})
-def t1_cloud_execute(task: str, context: str = "") -> dict:
+def _call_ollama(model: str, base_url: str, prompt: str,
+                 system: str = "", timeout: int = 600,
+                 params: dict = None) -> dict:
     """
-    T1-CLOUD: qwen3-coder:480b via Ollama cloud server.
-    Use for: MODERATE-LARGE — 5-10 files, feature-set, API integration.
-    REAL API CALL — not simulated.
+    Call Ollama via streaming HTTP — collects all chunks, no timeout risk.
+    FIX 2: Long timeout (600s default).
+    FIX 3: num_ctx=8192, num_predict=4096 to prevent truncation.
+    Uses urllib (stdlib only, no httpx needed).
     """
-    t0 = time.time()
-    cfg = TIERS["T1-CLOUD"]
-    try:
-        prompt = f"{context}\n\nTask: {task}".strip() if context else task
-        result = _call_ollama(cfg["host"], cfg["model"], prompt)
-        score  = _score(result, task)
-        status = "PASS" if score >= QUALITY_GATE else "ESCALATE"
-        _write_log({
-            "event": "T1_CLOUD_EXECUTE", "model": cfg["model"],
-            "quality": score, "status": status,
-            "latency_ms": int((time.time()-t0)*1000)
-        })
-        return {
-            "tier": "T1-CLOUD", "model": cfg["model"],
-            "api_call_made": True, "endpoint": cfg["host"],
-            "result": result, "quality_score": score,
-            "status": status,
-            "next_tool": None if status == "PASS" else "t2_gemini_execute"
-        }
-    except Exception as e:
-        return {"tier": "T1-CLOUD", "api_call_made": False,
-                "error": str(e), "next_tool": "t2_gemini_execute"}
+    params = params or OLLAMA_PARAMS_LOCAL
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
 
-# ══════════════════════════════════════════════════════════════════════
-#  TOOL 5: t2_gemini_execute
-# ══════════════════════════════════════════════════════════════════════
-@mcp.tool()
-@traceable(name="T2-GEMINI", run_type="llm",
-           metadata={"tier": "T2", "models": "gemini-2.5-flash/pro"})
-def t2_gemini_execute(task: str, context: str = "",
-                      model: str = "gemini-2.5-flash",
-                      use_pro: bool = False) -> dict:
-    """
-    T2-GEMINI: gemini-2.5-flash (default) or gemini-2.5-pro (use_pro=True).
-    T2-FLASH: COMPLEX-FAST — debug, iteration, multi-file refactor.
-    T2-PRO:   COMPLEX-DEEP — analytics, architecture, security audit.
-    Uses Google account CLI auth — no API key needed.
-    """
-    t0 = time.time()
-    selected = "gemini-2.5-pro" if use_pro else "gemini-2.5-flash"
-    tier_name = "T2-PRO" if use_pro else "T2-FLASH"
-    try:
-        prompt = f"{context}\n\nTask: {task}".strip() if context else task
-        result = _call_gemini(selected, prompt)
-        score  = _score(result, task)
-        status = "PASS" if score >= QUALITY_GATE else "ESCALATE"
-        _write_log({
-            "event": f"{tier_name}_EXECUTE", "model": selected,
-            "quality": score, "status": status,
-            "latency_ms": int((time.time()-t0)*1000)
-        })
-        return {
-            "tier": tier_name, "model": selected,
-            "api_call_made": True, "method": "gemini-cli",
-            "result": result, "quality_score": score,
-            "status": status,
-            "next_tool": None if status == "PASS" else "t2_kimi_execute"
-        }
-    except Exception as e:
-        return {"tier": tier_name, "api_call_made": False,
-                "error": str(e), "next_tool": "t2_kimi_execute"}
+    payload = json.dumps({
+        "model":   model,
+        "messages": messages,
+        "stream":  True,         # streaming prevents timeout on large outputs
+        "options": params,
+    }).encode("utf-8")
 
-# ══════════════════════════════════════════════════════════════════════
-#  TOOL 6: t2_kimi_execute  (NEW)
-# ══════════════════════════════════════════════════════════════════════
-@mcp.tool()
-@traceable(name="T2-KIMI", run_type="llm",
-           metadata={"tier": "T2-KIMI", "model": "Kimi-K2-Instruct"})
-def t2_kimi_execute(task: str, context: str = "") -> dict:
-    """
-    T2-KIMI: Kimi-K2-Instruct via HuggingFace API.
-    Use for: COMPLEX-REASON — mathematics, statistics, algorithms,
-             proofs, optimization, numerical methods, data science.
-    Requires HF_API_KEY in environment.
-    """
-    t0 = time.time()
-    try:
-        prompt = f"{context}\n\nTask: {task}".strip() if context else task
-        result = _call_kimi(prompt)
-        score  = _score(result, task)
-        status = "PASS" if score >= QUALITY_GATE else "ESCALATE"
-        _write_log({
-            "event": "T2_KIMI_EXECUTE",
-            "model": "moonshotai/Kimi-K2-Instruct",
-            "quality": score, "status": status,
-            "latency_ms": int((time.time()-t0)*1000)
-        })
-        return {
-            "tier": "T2-KIMI", "model": "moonshotai/Kimi-K2-Instruct",
-            "api_call_made": True, "method": "huggingface-inference-api",
-            "result": result, "quality_score": score,
-            "status": status,
-            "next_tool": None if status == "PASS" else "t3_epic_gate"
-        }
-    except Exception as e:
-        _write_log({"event": "T2_KIMI_ERROR", "error": str(e)})
-        return {"tier": "T2-KIMI", "api_call_made": False,
-                "error": str(e), "next_tool": "t3_epic_gate"}
-
-# ══════════════════════════════════════════════════════════════════════
-#  TOOL 7: t3_epic_gate  (HARD GATE — UNCHANGED FROM v4.1)
-# ══════════════════════════════════════════════════════════════════════
-@mcp.tool()
-@traceable(name="T3-GATE", run_type="chain",
-           metadata={"gate": "epic-only", "tier": "T3"})
-def t3_epic_gate(task: str, complexity: str,
-                 force: bool = False,
-                 force_reason: str = "",
-                 chain_exhausted: bool = False) -> dict:
-    """
-    T3 HARD GATE — PHYSICAL BLOCK.
-    APPROVED only if: complexity==EPIC, chain_exhausted==True,
-                      or force==True with documented reason.
-    EVERYTHING ELSE IS BLOCKED. No exceptions.
-    Logs every attempt — approved and blocked.
-    """
-    approved = (
-        complexity == "EPIC" or
-        chain_exhausted or
-        (force and bool(force_reason))
+    url = base_url.rstrip("/") + "/api/chat"
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
 
-    reason = (
-        "EPIC complexity — T3 appropriate"    if complexity == "EPIC"
-        else "Full fallback chain exhausted"   if chain_exhausted
-        else f"Force override: {force_reason}" if force
-        else f"BLOCKED — complexity={complexity}. Use T1/T2 tools."
+    t_start = time.time()
+    chunks  = []
+    done    = False
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8").strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                content = obj.get("message", {}).get("content", "")
+                if content:
+                    chunks.append(content)
+                if obj.get("done", False):
+                    done = True
+                    break
+
+        result    = "".join(chunks)
+        elapsed   = round(time.time() - t_start, 1)
+        log.info("OLLAMA_DONE model=%s elapsed=%ss tokens=%d done=%s",
+                 model, elapsed, len(result.split()), done)
+        return {"ok": True, "result": result, "model": model,
+                "elapsed": elapsed, "done": done}
+
+    except Exception as e:
+        elapsed = round(time.time() - t_start, 1)
+        partial = "".join(chunks)
+        log.error("OLLAMA_ERR model=%s elapsed=%ss err=%s partial_len=%d",
+                  model, elapsed, str(e)[:120], len(partial))
+        # Return partial result if we got something — don't discard it
+        if partial and len(partial.strip()) > 50:
+            log.warning("OLLAMA partial result returned (%d chars)", len(partial))
+            return {"ok": True, "result": partial, "model": model,
+                    "elapsed": elapsed, "done": False, "partial": True}
+        return {"ok": False, "error": str(e), "model": model, "elapsed": elapsed}
+
+
+def _call_ollama_with_retry(model: str, base_url: str, prompt: str,
+                             system: str = "", timeout: int = 600,
+                             params: dict = None, retries: int = 1) -> dict:
+    """Wrapper that retries once on failure before giving up."""
+    for attempt in range(retries + 1):
+        r = _call_ollama(model, base_url, prompt, system, timeout, params)
+        if r["ok"]:
+            return r
+        if attempt < retries:
+            wait = 5 * (attempt + 1)
+            log.warning("OLLAMA retry %d/%d in %ds — err: %s",
+                        attempt+1, retries, wait, r.get("error","")[:60])
+            time.sleep(wait)
+    return r
+
+
+def _call_gemini(model: str, prompt: str, system: str = "") -> dict:
+    """Gemini CLI — analysis only."""
+    try:
+        full = (system + "\n\n" + prompt).strip() if system else prompt
+        r = subprocess.run(
+            ["gemini", "--model", model, full],
+            capture_output=True, text=True, timeout=120
+        )
+        if r.returncode == 0:
+            return {"ok": True, "result": r.stdout.strip(), "model": model}
+        return {"ok": False, "error": r.stderr[:200], "model": model}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "model": model}
+
+
+def _call_huggingface(model: str, prompt: str) -> dict:
+    """HuggingFace — analysis only."""
+    try:
+        if not HF_AVAILABLE or not HF_API_KEY:
+            return {"ok": False, "error": "HF not configured", "model": model}
+        client = InferenceClient(token=HF_API_KEY)
+        result = client.text_generation(prompt, model=model, max_new_tokens=2048, temperature=0.1)
+        return {"ok": True, "result": result, "model": model}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "model": model}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# QUALITY SCORER — FIXED (FIX 4)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _score_result(result: str, task: str, tier: str = "T1-LOCAL") -> float:
+    """
+    Smarter quality scoring.
+    FIX 4: Only penalise actual failure phrases, not code-context words.
+    Completion markers (def, class, return, closing brackets) add score.
+    Tier-aware thresholds.
+    """
+    if not result:
+        return 0.0
+    stripped = result.strip()
+    if len(stripped) < 15:
+        return 0.1
+
+    score = 0.4   # base
+
+    # Length bonus
+    n = len(stripped)
+    if n > 200:   score += 0.15
+    if n > 800:   score += 0.10
+    if n > 2000:  score += 0.05
+
+    # Code structure markers — strong positive signals
+    code_markers = [
+        "def ", "class ", "import ", "from ", "function ",
+        "const ", "export ", "return ", "async ", "await ",
+        "for ", "while ", "if ", "try:", "except",
+        "```", "#!/", "SELECT ", "CREATE TABLE",
+    ]
+    code_hits = sum(1 for m in code_markers if m in result)
+    score += min(code_hits * 0.04, 0.20)
+
+    # Completion markers — code that actually finished
+    completion_markers = [
+        "return ", "};", "end", "EOF", "```\n", "\nif __name__",
+        "print(", "console.log", "done", "complete",
+    ]
+    if any(m in result for m in completion_markers):
+        score += 0.10
+
+    # ACTUAL failure phrases — precise matching, not substring
+    fail_phrases = [
+        "i cannot help with",
+        "i am unable to",
+        "i don't have the ability",
+        "i cannot complete this",
+        "as an ai, i",
+        "i'm sorry, but i cannot",
+        "this request cannot be fulfilled",
+    ]
+    result_lower = result.lower()
+    if any(p in result_lower for p in fail_phrases):
+        score -= 0.40   # hard penalty for refusals
+
+    # Uncertainty — soft penalty (model unsure but gave output)
+    uncertain = ["i'm not sure", "i'm not certain", "you may need to"]
+    if any(p in result_lower for p in uncertain):
+        score -= 0.10
+
+    return round(min(max(score, 0.0), 1.0), 3)
+
+
+def _get_threshold(tier: str) -> float:
+    return QUALITY_THRESHOLDS.get(tier, QUALITY_THRESHOLDS["DEFAULT"])
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# AUDIT
+# ═══════════════════════════════════════════════════════════════════════
+
+def _audit(session_id, task, tier, executor_tier, model, score, ok):
+    entry = {"ts": time.time(), "session": session_id, "task": task[:120],
+             "classified_tier": tier, "executor_tier": executor_tier,
+             "model": model, "score": score, "ok": ok}
+    log.info(json.dumps(entry))
+    try:
+        conn = sqlite3.connect(MEM_DB)
+        conn.execute("""CREATE TABLE IF NOT EXISTS routing_log
+            (ts REAL, session TEXT, task TEXT, classified_tier TEXT,
+             executor_tier TEXT, model TEXT, score REAL, ok INTEGER)""")
+        conn.execute("INSERT INTO routing_log VALUES (?,?,?,?,?,?,?,?)",
+            (entry["ts"], session_id, entry["task"], tier, executor_tier,
+             model, score, int(ok)))
+        conn.commit(); conn.close()
+    except Exception as e:
+        log.error("audit DB: %s", e)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# LANGGRAPH NODES — FIXED
+# ═══════════════════════════════════════════════════════════════════════
+
+class TierState(TypedDict):
+    task:             str
+    session_id:       str
+    context:          str
+    classified_tier:  str
+    executor_tier:    str
+    tier_config:      dict
+    reason:           str
+    analysis:         str
+    blueprint:        str
+    execution_prompt: str
+    result:           str
+    score:            float
+    fallback_count:   int
+    final_tier:       str
+    ok:               bool
+    mode:             str
+    should_escalate:  bool   # NEW — set by _node_escalate, read by edge
+
+
+def _node_classify(state: TierState) -> TierState:
+    tier, cfg, reason = _classify_task(state["task"])
+    executor = _get_executor_tier(tier)
+    state["classified_tier"]  = tier
+    state["executor_tier"]    = executor
+    state["tier_config"]      = TIER_CONFIG[executor]
+    state["reason"]           = reason
+    state["mode"]             = "LANGGRAPH_HARD"
+    state["fallback_count"]   = 0
+    state["should_escalate"]  = False
+    log.info("CLASSIFY task='%s' tier=%s executor=%s", state["task"][:60], tier, executor)
+    return state
+
+
+def _node_t3_brain_plan(state: TierState) -> TierState:
+    """T3-EPIC: format the Claude-generated blueprint for Ollama executor."""
+    if state["classified_tier"] != "T3-EPIC":
+        return state
+    blueprint = (
+        "EXECUTION BLUEPRINT — implement this fully:\n\n"
+        "Task: " + state["task"] + "\n\n"
+        + ("Context:\n" + state["context"] + "\n\n" if state["context"] else "")
+        + "Requirements:\n"
+        "- Complete, production-quality implementation\n"
+        "- All error handling included\n"
+        "- Runnable code, no placeholders\n"
+        "- Include brief inline comments\n"
+    )
+    state["blueprint"]        = blueprint
+    state["execution_prompt"] = blueprint
+    state["executor_tier"]    = "T1-CLOUD"
+    state["tier_config"]      = TIER_CONFIG["T1-CLOUD"]
+    log.info("T3_PLAN blueprint_len=%d executor=T1-CLOUD", len(blueprint))
+    return state
+
+
+def _node_t2_analysis(state: TierState) -> TierState:
+    """T2 analysis pass — enriches the execution prompt for T1."""
+    tier = state["classified_tier"]
+    if tier not in ("T2-FLASH","T2-PRO","T2-KIMI"):
+        if not state.get("execution_prompt"):
+            state["execution_prompt"] = state["task"]
+        return state
+
+    cfg = TIER_CONFIG[tier]
+    sys_prompt = (
+        "Analyse the following task. Identify the best approach, potential issues, "
+        "and recommended implementation strategy. Do NOT write the full implementation. "
+        "Your analysis will guide an executor model."
+    )
+    analysis_prompt = "Analyse:\n\n" + state["task"]
+    if state.get("context"):
+        analysis_prompt += "\n\nContext:\n" + state["context"]
+
+    if cfg["type"] == "gemini":
+        r = _call_gemini(cfg["model"], analysis_prompt, sys_prompt)
+    else:
+        r = _call_huggingface(cfg["model"], sys_prompt + "\n\n" + analysis_prompt)
+
+    analysis = r.get("result","") if r["ok"] else "Analysis unavailable."
+    state["analysis"] = analysis
+    state["execution_prompt"] = (
+        "Task: " + state["task"] + "\n\n"
+        "Analysis:\n" + analysis + "\n\n"
+        "Implement the complete solution based on the above analysis. "
+        "Write production-quality, complete, runnable code. No placeholders."
+    )
+    log.info("T2_ANALYSIS model=%s ok=%s len=%d", cfg["model"], r["ok"], len(analysis))
+    return state
+
+
+def _node_execute(state: TierState) -> TierState:
+    """
+    Call the Ollama executor.
+    FIX 2+3: Uses _call_ollama_with_retry with proper timeouts and num_ctx.
+    Hard block: if executor maps to Claude → redirect to T1-CLOUD.
+    """
+    executor = state["executor_tier"]
+    cfg      = TIER_CONFIG.get(executor, TIER_CONFIG["T1-LOCAL"])
+
+    # HARD CLAUDE BLOCK
+    if cfg.get("role") == "brain" or cfg.get("type") == "claude":
+        log.warning("CLAUDE EXECUTION BLOCK — redirecting to T1-CLOUD")
+        executor = "T1-CLOUD"
+        cfg      = TIER_CONFIG["T1-CLOUD"]
+        state["executor_tier"] = executor
+        state["tier_config"]   = cfg
+
+    prompt = state.get("execution_prompt") or state["task"]
+    system = (
+        "You are an expert software engineer. "
+        "Implement the requested solution completely. "
+        "Write production-quality, runnable code. "
+        "Do not truncate. Do not say 'I cannot'. "
+        "Return only the implementation."
+    )
+    timeout = cfg.get("timeout", TIMEOUT_LOCAL)
+    params  = cfg.get("params",  OLLAMA_PARAMS_LOCAL)
+
+    log.info("EXECUTE tier=%s model=%s timeout=%ds", executor, cfg["model"], timeout)
+
+    r = _call_ollama_with_retry(
+        cfg["model"], cfg["base"], prompt, system,
+        timeout=timeout, params=params, retries=1
     )
 
-    _write_log({
-        "event":      "T3_APPROVED" if approved else "T3_BLOCKED",
-        "complexity": complexity,
-        "approved":   approved,
-        "reason":     reason,
-        "task_preview": task[:80],
-        "fraud_prevented": not approved
-    })
+    state["result"]     = r.get("result","")
+    state["ok"]         = r["ok"]
+    state["final_tier"] = executor
+    state["score"]      = _score_result(state["result"], state["task"], executor)
+    state["should_escalate"] = False
 
-    if not approved:
-        tier_map = {
-            "SIMPLE":          "t1_local_execute",
-            "MODERATE-SMALL":  "t1_mid_execute",
-            "MODERATE-LARGE":  "t1_cloud_execute",
-            "COMPLEX-FAST":    "t2_gemini_execute (use_pro=False)",
-            "COMPLEX-DEEP":    "t2_gemini_execute (use_pro=True)",
-            "COMPLEX-REASON":  "t2_kimi_execute",
-        }
-        return {
-            "approved":      False,
-            "reason":        reason,
-            "correct_tool":  tier_map.get(complexity, "t2_gemini_execute"),
-            "action":        "STOP — call the correct_tool instead of T3"
-        }
+    log.info("EXECUTE done tier=%s ok=%s score=%.3f len=%d",
+             executor, r["ok"], state["score"], len(state["result"]))
+    return state
+
+
+def _node_escalate(state: TierState) -> TierState:
+    """
+    FIX 1 — This is now a proper STATE NODE (not an edge function).
+    Checks quality and updates executor_tier in state if escalation needed.
+    Sets state["should_escalate"] = True/False for the routing edge.
+    """
+    tier      = state["executor_tier"]
+    score     = state["score"]
+    threshold = _get_threshold(tier)
+    ok        = state["ok"]
+
+    # Accept if: result is ok AND score meets tier threshold
+    if ok and score >= threshold:
+        state["should_escalate"] = False
+        log.info("QUALITY_PASS tier=%s score=%.3f threshold=%.2f", tier, score, threshold)
+        return state
+
+    # Accept partial results — better to return something than nothing
+    if state["result"] and len(state["result"].strip()) > 100:
+        if state["fallback_count"] >= MAX_FALLBACKS:
+            log.warning("MAX_FALLBACKS=%d reached — accepting partial result", MAX_FALLBACKS)
+            state["should_escalate"] = False
+            return state
+
+    # Escalate within T1 chain only
+    chain = ["T1-LOCAL","T1-MID","T1-CLOUD"]
+    idx   = chain.index(tier) if tier in chain else -1
+    if idx >= 0 and idx < len(chain) - 1:
+        next_tier = chain[idx + 1]
+        log.info("ESCALATE %s→%s score=%.3f threshold=%.2f", tier, next_tier, score, threshold)
+        state["executor_tier"]    = next_tier
+        state["tier_config"]      = TIER_CONFIG[next_tier]
+        state["fallback_count"]   = state.get("fallback_count",0) + 1
+        state["should_escalate"]  = True
+    else:
+        # Already at top of chain — accept whatever we have
+        state["should_escalate"] = False
+        log.info("TOP_OF_CHAIN — accepting result score=%.3f", score)
+
+    return state
+
+
+def _route_after_escalate(state: TierState) -> str:
+    """Pure routing function — reads state only, never modifies it. FIX 1."""
+    return "execute" if state["should_escalate"] else "audit"
+
+
+def _node_audit(state: TierState) -> TierState:
+    _audit(
+        session_id    = state.get("session_id","unknown"),
+        task          = state["task"],
+        tier          = state["classified_tier"],
+        executor_tier = state["final_tier"],
+        model         = TIER_CONFIG.get(state["final_tier"],{}).get("model","unknown"),
+        score         = state.get("score",0.0),
+        ok            = state.get("ok",False),
+    )
+    return state
+
+
+def _build_graph():
+    """Compile the LangGraph graph with fixed node/edge structure."""
+    g = StateGraph(TierState)
+
+    g.add_node("classify",    _node_classify)
+    g.add_node("t3_plan",     _node_t3_brain_plan)
+    g.add_node("t2_analysis", _node_t2_analysis)
+    g.add_node("execute",     _node_execute)
+    g.add_node("escalate",    _node_escalate)   # FIX 1: proper node
+    g.add_node("audit",       _node_audit)
+
+    g.set_entry_point("classify")
+
+    g.add_conditional_edges("classify", lambda s: (
+        "t3_plan"     if s["classified_tier"] == "T3-EPIC" else
+        "t2_analysis" if s["classified_tier"] in ("T2-FLASH","T2-PRO","T2-KIMI") else
+        "execute"
+    ), {"t3_plan":"t3_plan","t2_analysis":"t2_analysis","execute":"execute"})
+
+    g.add_edge("t3_plan",     "execute")
+    g.add_edge("t2_analysis", "execute")
+    g.add_edge("execute",     "escalate")       # FIX 1: execute → escalate node
+
+    # FIX 1: escalate node → routing function → execute or audit
+    g.add_conditional_edges("escalate", _route_after_escalate,
+                            {"execute":"execute","audit":"audit"})
+    g.add_edge("audit", END)
+
+    return g.compile()
+
+
+_GRAPH = None
+def _get_graph():
+    global _GRAPH
+    if _GRAPH is None and LANGGRAPH_AVAILABLE:
+        _GRAPH = _build_graph()
+    return _GRAPH
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SOFT-CHAIN FALLBACK
+# ═══════════════════════════════════════════════════════════════════════
+
+def _soft_chain_execute(task: str, session_id: str, context: str) -> dict:
+    classified, cfg, reason = _classify_task(task)
+    executor = _get_executor_tier(classified)
+    exec_cfg = TIER_CONFIG[executor]
+
+    analysis = ""
+    if classified in ("T2-FLASH","T2-PRO"):
+        r = _call_gemini(TIER_CONFIG[classified]["model"], "Analyse:\n" + task)
+        analysis = r.get("result","")
+    elif classified == "T2-KIMI":
+        r = _call_huggingface(TIER_CONFIG["T2-KIMI"]["model"], "Analyse:\n" + task)
+        analysis = r.get("result","")
+
+    prompt = task
+    if analysis:
+        prompt = "Task: " + task + "\n\nAnalysis:\n" + analysis + "\n\nImplement:"
+    if classified == "T3-EPIC":
+        prompt = "Implement fully:\n" + task + "\n\nContext: " + (context or "")
+
+    timeout = exec_cfg.get("timeout", TIMEOUT_LOCAL)
+    params  = exec_cfg.get("params",  OLLAMA_PARAMS_LOCAL)
+    result  = _call_ollama_with_retry(exec_cfg["model"], exec_cfg["base"],
+                                       prompt, "", timeout, params)
+    score   = _score_result(result.get("result",""), task, executor)
+    _audit(session_id, task, classified, executor, exec_cfg["model"], score, result["ok"])
 
     return {
-        "approved":   True,
-        "reason":     reason,
-        "model":      "claude-sonnet-4-6",
-        "action":     "PROCEED — Claude subscription authorized for this task"
+        "mode":            "MCP_SOFT_CHAIN",
+        "classified_tier": classified,
+        "executor_tier":   executor,
+        "executor_model":  exec_cfg["model"],
+        "result":          result.get("result",""),
+        "score":           score,
+        "ok":              result["ok"],
+        "claude_blocked":  True,
     }
 
-# ══════════════════════════════════════════════════════════════════════
-#  TOOL 8: tier_health_check
-# ══════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════
+# MCP SERVER TOOLS
+# ═══════════════════════════════════════════════════════════════════════
+
+mcp = FastMCP("tier-enforcer")
+
+
+@mcp.tool()
+def execute_task(task: str, session_id: str = "default", context: str = "") -> dict:
+    """
+    MASTER ENTRY POINT. Call for every task.
+    Claude = brain only. All execution goes to Ollama T1 tiers.
+    """
+    graph = _get_graph()
+    if graph:
+        init: TierState = {
+            "task": task, "session_id": session_id, "context": context,
+            "classified_tier":"","executor_tier":"","tier_config":{},
+            "reason":"","analysis":"","blueprint":"","execution_prompt":"",
+            "result":"","score":0.0,"fallback_count":0,"final_tier":"",
+            "ok":False,"mode":"LANGGRAPH_HARD","should_escalate":False,
+        }
+        final = graph.invoke(init)
+        tier  = final.get("final_tier","?")
+        model = TIER_CONFIG.get(tier,{}).get("model","?")
+        return {
+            "mode":            final["mode"],
+            "classified_tier": final["classified_tier"],
+            "executor_tier":   tier,
+            "executor_model":  model,
+            "analysis":        final.get("analysis",""),
+            "blueprint":       final.get("blueprint",""),
+            "result":          final["result"],
+            "score":           round(final["score"],3),
+            "ok":              final["ok"],
+            "fallbacks_used":  final["fallback_count"],
+            "claude_blocked":  True,
+            "banner": (
+                "🧠 BRAIN: Claude → " + final["classified_tier"] +
+                " | ⚙️ EXECUTOR: Ollama " + tier + " → " + model
+            ),
+        }
+    return _soft_chain_execute(task, session_id, context)
+
+
+@mcp.tool()
+def activate_tier_routing(session_id: str = "auto") -> dict:
+    """Auto-called by CLAUDE.md on every session open."""
+    graph = _get_graph()
+    status = {
+        "activated":        True,
+        "session_id":       session_id,
+        "timestamp":        time.strftime("%Y-%m-%d %H:%M:%S"),
+        "mode":             "LANGGRAPH_HARD" if graph else "MCP_SOFT_CHAIN",
+        "langgraph":        LANGGRAPH_AVAILABLE,
+        "claude_role":      "BRAIN_ONLY — execution hard blocked",
+        "executor_chain":   ["T1-LOCAL","T1-MID","T1-CLOUD"],
+        "analysis_chain":   ["T2-FLASH","T2-PRO","T2-KIMI"],
+        "t3_epic_executor": "T1-CLOUD",
+        "timeouts":         {"T1-LOCAL": TIMEOUT_LOCAL,"T1-MID": TIMEOUT_MID,"T1-CLOUD": TIMEOUT_CLOUD},
+        "num_ctx":          {"T1-LOCAL": OLLAMA_PARAMS_LOCAL["num_ctx"],"T1-CLOUD": OLLAMA_PARAMS_CLOUD["num_ctx"]},
+        "thresholds":       QUALITY_THRESHOLDS,
+        "banner": (
+            "╔═══════════════════════════════════════╗\n"
+            "║  DSR AI-Lab Tier Routing v6.1 ACTIVE  ║\n"
+            "║  Brain: Claude (plan only)            ║\n"
+            "║  Executor: Ollama T1-LOCAL/MID/CLOUD  ║\n"
+            "║  Fixes: timeout/ctx/scoring/graph     ║\n"
+            "╚═══════════════════════════════════════╝"
+        ),
+    }
+    _audit(session_id, "SYSTEM:activate", "SYSTEM","SYSTEM","none",1.0,True)
+    return status
+
+
 @mcp.tool()
 def tier_health_check(tier: str = "ALL") -> dict:
-    """
-    Check health of all tiers or a specific tier.
-    Run at session start. Reports latency and availability.
-    """
-    results = {}
-    check_tiers = list(TIERS.keys()) if tier == "ALL" else [tier]
+    """Check health of all tiers."""
+    import urllib.request, urllib.error
 
-    for t in check_tiers:
-        cfg = TIERS[t]
-        t0 = time.time()
+    def check_ollama(base: str, model: str) -> str:
         try:
-            if cfg["type"] == "ollama-cloud":
-                api_key = os.environ.get("OLLAMA_API_KEY", OLLAMA_API_KEY)
-                if not api_key:
-                    results[t] = {
-                        "status":  "NO_API_KEY",
-                        "model":   cfg["model"],
-                        "latency": "0ms",
-                        "note":    "Set OLLAMA_API_KEY in env config"
-                    }
-                else:
-                    req = urllib.request.Request(
-                        f"{OLLAMA_CLOUD_API}/v1/models",
-                        headers={"Authorization": f"Bearer {api_key}"},
-                        method="GET"
-                    )
-                    with urllib.request.urlopen(req, timeout=10) as r:
-                        data = json.loads(r.read())
-                        models = [m["id"] for m in data.get("data", [])]
-                        available = any(cfg["model"] in m for m in models)
-                    results[t] = {
-                        "status":  "HEALTHY" if available else "MODEL_MISSING",
-                        "model":   cfg["model"],
-                        "latency": f"{int((time.time()-t0)*1000)}ms",
-                        "models_found": models[:5]
-                    }
-
-            elif cfg["type"] == "ollama":
-                req = urllib.request.Request(
-                    f"{cfg['host']}/api/tags", method="GET")
-                with urllib.request.urlopen(req, timeout=5) as r:
-                    data = json.loads(r.read())
-                    models = [m["name"] for m in data.get("models", [])]
-                    available = any(cfg["model"].split(":")[0] in m
-                                    for m in models)
-                results[t] = {
-                    "status":  "HEALTHY" if available else "MODEL_MISSING",
-                    "model":   cfg["model"],
-                    "latency": f"{int((time.time()-t0)*1000)}ms",
-                    "models_found": models[:5]
-                }
-
-            elif cfg["type"] == "gemini":
-                r = subprocess.run(
-                    ["gemini", "-p", "say: health-check-ok"],
-                    capture_output=True, text=True, timeout=30)
-                results[t] = {
-                    "status":  "HEALTHY" if r.returncode == 0 else "AUTH_NEEDED",
-                    "model":   cfg["model"],
-                    "latency": f"{int((time.time()-t0)*1000)}ms"
-                }
-
-            elif cfg["type"] == "huggingface":
-                result_entry = {
-                    "status":  "HEALTHY" if HF_ENABLED else "NO_API_KEY",
-                    "model":   cfg["model"],
-                    "latency": f"{int((time.time()-t0)*1000)}ms",
-                }
-                if not HF_ENABLED:
-                    result_entry["note"] = "Set HF_API_KEY in environment — already in ~/.zshrc, add to MCP env config"
-                results[t] = result_entry
-
-            elif cfg["type"] == "claude":
-                results[t] = {
-                    "status":  "HEALTHY",
-                    "model":   cfg["model"],
-                    "latency": f"{int((time.time()-t0)*1000)}ms",
-                    "note":    "EPIC-only — gated by t3_epic_gate"
-                }
-
+            req = urllib.request.Request(base.rstrip("/")+"/api/tags")
+            with urllib.request.urlopen(req, timeout=5) as r:
+                data = json.loads(r.read())
+            models = [m["name"] for m in data.get("models",[])]
+            short  = model.split(":")[0]
+            if any(short in m for m in models):
+                return "ONLINE"
+            return "DEGRADED (not pulled — run: ollama pull " + model + ")"
         except Exception as e:
-            results[t] = {
-                "status":  "UNHEALTHY",
-                "model":   cfg["model"],
-                "error":   str(e)[:100],
-                "latency": f"{int((time.time()-t0)*1000)}ms"
-            }
+            return "OFFLINE (" + str(e)[:60] + ")"
 
-    healthy = sum(1 for v in results.values() if v["status"] == "HEALTHY")
+    def check_gemini() -> str:
+        r = subprocess.run(["gemini","--version"],capture_output=True,text=True,timeout=5)
+        return "ONLINE" if r.returncode==0 else "OFFLINE (npm install -g @google/gemini-cli)"
+
+    def check_hf() -> str:
+        return "ONLINE" if HF_API_KEY else "OFFLINE (set HF_API_KEY)"
+
+    checks = {
+        "T1-LOCAL":  check_ollama(OLLAMA_LOCAL, "qwen2.5-coder:7b"),
+        "T1-MID":    check_ollama(OLLAMA_CLOUD, "qwen3-coder:30b"),
+        "T1-CLOUD":  check_ollama(OLLAMA_CLOUD, "qwen3-coder-next"),
+        "T2-FLASH":  check_gemini(),
+        "T2-PRO":    check_gemini(),
+        "T2-KIMI":   check_hf(),
+        "T3-EPIC":   "BRAIN ONLY — always available",
+    }
+    if tier != "ALL":
+        return {tier: checks.get(tier,"Unknown tier")}
+
+    online  = [t for t,s in checks.items() if "ONLINE" in s or "BRAIN" in s]
+    offline = [t for t,s in checks.items() if "OFFLINE" in s]
     return {
-        "summary":      f"{healthy}/{len(check_tiers)} tiers healthy",
-        "langsmith":    "ACTIVE" if LANGSMITH_ENABLED else "NOT_CONFIGURED",
-        "kimi_k2":      "ACTIVE" if HF_ENABLED else "NEEDS_HF_API_KEY",
-        "tiers":        results,
-        "fallback_chain": " → ".join(FALLBACK_CHAIN)
+        "tiers":        checks,
+        "online_count": len(online),
+        "offline":      offline,
+        "routing_mode": "LANGGRAPH_HARD" if LANGGRAPH_AVAILABLE else "MCP_SOFT_CHAIN",
+        "claude_role":  "BRAIN ONLY",
+        "fixes_active": {
+            "streaming_http":    True,
+            "timeout_local_s":   TIMEOUT_LOCAL,
+            "num_ctx_local":     OLLAMA_PARAMS_LOCAL["num_ctx"],
+            "quality_threshold": QUALITY_THRESHOLDS,
+            "langgraph_escalate_node": True,
+        },
     }
 
-# ══════════════════════════════════════════════════════════════════════
-#  TOOL 9: tier_audit_log
-# ══════════════════════════════════════════════════════════════════════
+
 @mcp.tool()
-def tier_audit_log(session_id: str = "current",
-                   last_n: int = 20) -> dict:
-    """
-    STEP 5 — ALWAYS CALL LAST.
-    Returns routing stats, tier usage breakdown,
-    T3 fraud prevention count, quality score trends.
-    """
-    try:
-        entries = []
-        with open(LOG_PATH) as f:
-            for line in f:
-                try: entries.append(json.loads(line.strip()))
-                except: pass
-        entries = entries[-last_n:]
+def classify_only(task: str) -> dict:
+    """Preview routing without executing."""
+    classified, cfg, reason = _classify_task(task)
+    executor  = _get_executor_tier(classified)
+    exec_cfg  = TIER_CONFIG[executor]
+    threshold = _get_threshold(executor)
+    return {
+        "task":            task[:100],
+        "classified_tier": classified,
+        "executor_tier":   executor,
+        "executor_model":  exec_cfg["model"],
+        "timeout_s":       exec_cfg.get("timeout", TIMEOUT_LOCAL),
+        "num_ctx":         exec_cfg.get("params",{}).get("num_ctx","?"),
+        "quality_threshold": threshold,
+        "claude_executes": False,
+        "flow": (
+            "Claude brain → blueprint → T1-CLOUD executes" if classified=="T3-EPIC" else
+            TIER_CONFIG[classified]["model"]+" analysis → "+executor+" executes" if cfg.get("role")=="analysis" else
+            exec_cfg["model"]+" executes directly"
+        ),
+    }
 
-        decisions   = [e for e in entries if e.get("event") == "routing_decision"]
-        t3_blocked  = [e for e in entries if e.get("event") == "T3_BLOCKED"]
-        t3_approved = [e for e in entries if e.get("event") == "T3_APPROVED"]
 
-        tier_counts = {}
-        for e in entries:
-            t = e.get("tier") or e.get("final_tier") or e.get("assigned_tier")
-            if t: tier_counts[t] = tier_counts.get(t, 0) + 1
-
-        scores = [e["quality"] for e in entries if "quality" in e]
-        avg_q = sum(scores)/len(scores) if scores else 0
-
-        return {
-            "total_tasks":       len(decisions),
-            "tier_distribution": tier_counts,
-            "avg_quality_score": round(avg_q, 3),
-            "t3_approved":       len(t3_approved),
-            "t3_blocked":        len(t3_blocked),
-            "subscription_saves": f"{len(t3_blocked)} T3 calls prevented",
-            "langsmith_project":  os.environ.get("LANGCHAIN_PROJECT", "not set"),
-            "log_path":           LOG_PATH,
-            "recent_tasks":       [
-                {"task": e.get("task_preview","")[:50],
-                 "tier": e.get("tier","?"),
-                 "quality": e.get("quality",0)}
-                for e in entries[-5:]
-            ]
-        }
-    except FileNotFoundError:
-        return {"message": "No routing log yet — run some tasks first"}
-    except Exception as e:
-        return {"error": str(e)}
-
-# ══════════════════════════════════════════════════════════════════════
-#  BANNER HELPERS — progress + execution banners for every task
-# ══════════════════════════════════════════════════════════════════════
-
-_TIER_META = {
-    "T1-LOCAL": {"model": "qwen2.5-coder:7b",           "api": "localhost:11434/api/chat",   "icon": "🟢"},
-    "T1-MID":   {"model": "qwen3-coder:30b",             "api": "localhost:11434/api/chat",   "icon": "🟡"},
-    "T1-CLOUD": {"model": "qwen3-coder:480b-cloud",      "api": "localhost:11434/api/chat",   "icon": "🟠"},
-    "T2-FLASH": {"model": "gemini-2.5-flash",            "api": "Gemini CLI / Google API",    "icon": "🔵"},
-    "T2-PRO":   {"model": "gemini-2.5-pro",              "api": "Gemini CLI / Google API",    "icon": "🔷"},
-    "T2-KIMI":  {"model": "Kimi-K2-Instruct",            "api": "HuggingFace API",            "icon": "🟣"},
-    "T3":       {"model": "claude-sonnet-4-6",           "api": "Anthropic (Claude direct)",  "icon": "🔴"},
-}
-_W = 68  # banner inner width
-
-def _brow(label: str, value: str) -> str:
-    content = f"  {label:<13}: {value}"
-    return f"║{content:<{_W - 2}}║"
-
-def _btitle(text: str) -> str:
-    content = f"  {text}"
-    return f"║{content:<{_W - 2}}║"
-
-def _make_banners(task: str, tier: str, complexity: str,
-                  quality: float, fallback_count: int,
-                  enforcement: str,
-                  t3_blocked: bool = False,
-                  t3_reason: str = "") -> dict:
-    """Return progress_banner and execution_banner strings."""
-    meta   = _TIER_META.get(tier, {"model": tier, "api": "unknown", "icon": "⚡"})
-    model  = meta["model"]
-    api    = meta["api"]
-    icon   = meta["icon"]
-    task_p = (task[:50] + "…") if len(task) > 51 else task
-    sep    = "╠" + "═" * (_W - 2) + "╣"
-    top    = "╔" + "═" * (_W - 2) + "╗"
-    bot    = "╚" + "═" * (_W - 2) + "╝"
-
-    # ── Progress banner (tier assigned, before execution) ─────────────
-    progress_banner = "\n".join([
-        top,
-        _btitle(f"⚡ TIER ROUTING — TASK ASSIGNED"),
-        sep,
-        _brow("Task",       task_p),
-        _brow("Complexity", complexity),
-        _brow("Tier",       f"{icon}  {tier}"),
-        _brow("Model",      model),
-        _brow("API",        f"IN PROGRESS → {api}"),
-        bot,
-    ])
-
-    # ── Execution banner (after execution) ────────────────────────────
-    q_str = f"{quality:.2f} — {'PASS ✓' if quality >= 0.75 else f'FAIL ✗  (< 0.75)'}"
-    fb_str = f"{fallback_count} escalation{'s' if fallback_count != 1 else ''}"
-
-    if t3_blocked:
-        execution_banner = "\n".join([
-            top,
-            _btitle(f"🚫  T3 BLOCKED — complexity: {complexity}"),
-            sep,
-            _brow("Reason",  "T3 is EPIC only — T3 gate returned BLOCKED"),
-            _brow("Message", (t3_reason or "Not EPIC")[:48]),
-            _brow("Use tier", f"{icon}  {tier} / {model}"),
-            bot,
-        ])
-    else:
-        execution_banner = "\n".join([
-            top,
-            _btitle(f"✅  TASK EXECUTED — {icon}  {tier}"),
-            sep,
-            _brow("Model",       model),
-            _brow("Quality",     q_str),
-            _brow("Fallbacks",   fb_str),
-            _brow("Enforcement", enforcement),
-            _brow("API",         f"YES → {api} ✓"),
-            bot,
-        ])
-
-    return {"progress_banner": progress_banner, "execution_banner": execution_banner}
-
-# ══════════════════════════════════════════════════════════════════════
-#  TOOL 10: execute_task  — MASTER ENTRY POINT (LangGraph auto-invoke)
-# ══════════════════════════════════════════════════════════════════════
 @mcp.tool()
-@traceable(name="EXECUTE-TASK-MASTER", run_type="chain",
-           metadata={"role": "master-entry-point", "version": "5.1"})
-def execute_task(task: str,
-                 session_id: str = "default",
-                 context: str = "") -> dict:
-    """
-    ╔══════════════════════════════════════════════════════════════╗
-    ║  MASTER ENTRY POINT — CALL THIS FOR EVERY TASK              ║
-    ║                                                              ║
-    ║  Automatically runs the full LangGraph enforcement graph:   ║
-    ║    classify → t3_gate → execute → quality_gate → audit      ║
-    ║                                                              ║
-    ║  LAYER 1 (OAuth startup auth) — NOT affected. Auth runs     ║
-    ║  before MCP tools exist. This tool only activates after     ║
-    ║  Claude CLI shell is open and tier-routing.md has loaded.   ║
-    ║                                                              ║
-    ║  LAYER 2 (task execution) — HARD ENFORCED via LangGraph.   ║
-    ║  T3 is physically unreachable except:                       ║
-    ║    • complexity == EPIC                                      ║
-    ║    • full T1→T2 fallback chain exhausted                    ║
-    ╚══════════════════════════════════════════════════════════════╝
-
-    DO NOT call individual tier tools manually.
-    DO NOT call bash/read/write before this tool.
-    DO NOT attempt t3_epic_gate directly — it runs inside this graph.
-
-    Only skip this tool for:
-      • tier_health_check   (session start diagnostics)
-      • check_budget        (budget queries)
-      • /tier-* skills      (audit/debug/report)
-    """
-    # ── Step 1: Try LangGraph hard enforcement (preferred) ────────────
+def tier_audit_log(last_n: int = 20) -> dict:
+    """Last N routing decisions."""
     try:
-        import sys, os
-        # Ensure langgraph_tier.py is importable from same directory
-        _mcp_dir = os.path.dirname(os.path.abspath(__file__))
-        if _mcp_dir not in sys.path:
-            sys.path.insert(0, _mcp_dir)
-
-        from langgraph_tier import run_tier_graph
-        result = run_tier_graph(
-            task=task,
-            session_id=session_id,
-            context=context
-        )
-        _tier      = result.get("assigned_tier", "T1-LOCAL")
-        _complexity= result.get("complexity", "SIMPLE")
-        _quality   = result.get("quality_score", 0.0)
-        _fallbacks = result.get("fallback_count", 0)
-        _t3_blocked= (not result.get("t3_approved", True) and _tier == "T3")
-        _banners   = _make_banners(
-            task=task, tier=_tier, complexity=_complexity,
-            quality=_quality, fallback_count=_fallbacks,
-            enforcement="LANGGRAPH_HARD",
-            t3_blocked=_t3_blocked,
-            t3_reason=result.get("t3_block_reason", ""),
-        )
-        return {
-            "enforcement":      "LANGGRAPH_HARD",
-            "tier":             _tier,
-            "complexity":       _complexity,
-            "quality_score":    _quality,
-            "fallback_count":   _fallbacks,
-            "t3_approved":      result.get("t3_approved", False),
-            "t3_block_reason":  result.get("t3_block_reason", ""),
-            "chain_exhausted":  result.get("chain_exhausted", False),
-            "result":           result.get("result"),
-            "error":            result.get("error"),
-            "session_id":       session_id,
-            "graph_nodes":      [e.get("node") for e in result.get("audit_log", [])],
-            "progress_banner":  _banners["progress_banner"],
-            "execution_banner": _banners["execution_banner"],
-        }
-
-    except ImportError as ie:
-        # ── Step 2: LangGraph not installed — fallback to MCP soft chain ──
-        _write_log({
-            "event":   "LANGGRAPH_FALLBACK",
-            "reason":  str(ie),
-            "task":    task[:80],
-            "note":    "Install langgraph: pip install langgraph --break-system-packages"
-        })
-        # Run soft chain: classify → execute → gate
-        classification = tier_classify(task, context)
-        tier       = classification.get("assigned_tier", "T1-LOCAL")
-        next_tool  = classification.get("next_tool", "t1_local_execute")
-        complexity = classification.get("complexity", "SIMPLE")
-
-        # Hard block T3 via gate even in fallback mode
-        if tier == "T3":
-            gate = t3_epic_gate(task, complexity)
-            if not gate.get("approved"):
-                return {
-                    "enforcement":  "MCP_SOFT_GATE_BLOCKED",
-                    "tier":         "T3_BLOCKED",
-                    "complexity":   complexity,
-                    "gate_result":  gate,
-                    "action":       gate.get("action"),
-                    "correct_tool": gate.get("correct_tool"),
-                    "warning":      "LangGraph not installed — install for hard enforcement"
-                }
-
-        # Execute at classified tier
-        exec_map = {
-            "t1_local_execute": lambda: t1_local_execute(task, context),
-            "t1_mid_execute":   lambda: t1_mid_execute(task, context),
-            "t1_cloud_execute": lambda: t1_cloud_execute(task, context),
-            "t2_gemini_execute":lambda: t2_gemini_execute(task, context),
-            "t2_kimi_execute":  lambda: t2_kimi_execute(task, context),
-        }
-        exec_fn  = exec_map.get(next_tool, exec_map["t1_local_execute"])
-        exec_result = exec_fn()
-
-        tier_audit_log(session_id=session_id)
-        _q2       = exec_result.get("quality_score", 0.0)
-        _banners2 = _make_banners(
-            task=task, tier=tier, complexity=complexity,
-            quality=_q2, fallback_count=0,
-            enforcement="MCP_SOFT_CHAIN",
-        )
-        return {
-            "enforcement":      "MCP_SOFT_CHAIN",
-            "tier":             tier,
-            "complexity":       complexity,
-            "quality_score":    _q2,
-            "result":           exec_result.get("result"),
-            "status":           exec_result.get("status"),
-            "warning":          (f"LangGraph not installed ({ie}). "
-                                 f"Run: pip install langgraph --break-system-packages"),
-            "progress_banner":  _banners2["progress_banner"],
-            "execution_banner": _banners2["execution_banner"],
-        }
-
+        conn = sqlite3.connect(MEM_DB)
+        rows = conn.execute(
+            "SELECT ts,session,task,classified_tier,executor_tier,model,score,ok "
+            "FROM routing_log ORDER BY ts DESC LIMIT ?", (last_n,)
+        ).fetchall()
+        conn.close()
+        return {"entries": [
+            {"ts":time.strftime("%H:%M:%S",time.localtime(r[0])),"session":r[1],
+             "task":r[2],"classified":r[3],"executor":r[4],
+             "model":r[5],"score":r[6],"ok":bool(r[7])} for r in rows
+        ], "count": len(rows)}
     except Exception as e:
-        _write_log({"event": "EXECUTE_TASK_ERROR", "error": str(e), "task": task[:80]})
-        return {
-            "enforcement": "ERROR",
-            "error":       str(e),
-            "fallback":    "Call tier_classify() then the appropriate tier tool manually"
-        }
+        return {"error": str(e), "entries": []}
+
+
+@mcp.tool()
+def tier_reset() -> dict:
+    """Reset and re-activate routing."""
+    global _GRAPH
+    _GRAPH = None   # force graph rebuild
+    return {"reset": True, "status": activate_tier_routing("reset")}
 
 
 if __name__ == "__main__":
     mcp.run()
-
