@@ -1,7 +1,7 @@
 # Architecture — Claude-Tier-MacMini 7-Tier AI Routing
 
-**Version:** v5.1+ | **Platform:** Mac Mini (Apple Silicon, macOS) | **Updated:** 2026-03-12
-**Status:** 7/7 tiers LIVE · LangGraph COMPILED · Progress & Execution Banners ACTIVE
+**Version:** v6.1 | **Platform:** Mac Mini (Apple Silicon, macOS) | **Updated:** 2026-03-19 IST
+**Status:** 7/7 tiers LIVE · LangGraph COMPILED · Progress & Execution Banners ACTIVE · T1-MID qwen2.5-coder:14b LOCAL
 
 ---
 
@@ -67,7 +67,7 @@ PASS (quality ≥ 0.75):
   ✅  TASK EXECUTED — 🔴  T3        quality: 0.95 — PASS ✓  fallbacks: 0
 
 ESCALATION (quality < 0.75):
-  ✅  TASK EXECUTED — 🟡  T1-MID    quality: 0.61 — FAIL ✗  fallbacks: 1
+  ✅  TASK EXECUTED — 🟡  T1-MID (qwen2.5-coder:14b)  quality: 0.61 — FAIL ✗  fallbacks: 1
 
 T3 BLOCKED (non-EPIC hits T3 gate):
   🚫  T3 BLOCKED — complexity: SIMPLE
@@ -81,7 +81,7 @@ Located in `tier-enforcer-mcp/server.py`:
 ```python
 _TIER_META = {
     "T1-LOCAL": {"model": "qwen2.5-coder:7b",        "api": "localhost:11434/api/chat", "icon": "🟢"},
-    "T1-MID":   {"model": "qwen3-coder:30b",          "api": "localhost:11434/api/chat", "icon": "🟡"},
+    "T1-MID":   {"model": "qwen2.5-coder:14b",         "api": "localhost:11434/api/chat", "icon": "🟡"},
     "T1-CLOUD": {"model": "qwen3-coder:480b-cloud",   "api": "localhost:11434/api/chat", "icon": "🟠"},
     "T2-FLASH": {"model": "gemini-2.5-flash",         "api": "Gemini CLI / Google API",  "icon": "🔵"},
     "T2-PRO":   {"model": "gemini-2.5-pro",           "api": "Gemini CLI / Google API",  "icon": "🔷"},
@@ -134,7 +134,7 @@ def _make_banners(task, tier, complexity, quality, fallback_count,
 │                                                                             │
 │  EXECUTION LAYER                                                            │
 │  🟢 T1-LOCAL  qwen2.5-coder:7b      localhost:11434  SIMPLE                │
-│  🟡 T1-MID    qwen3-coder:30b       localhost:11434  MODERATE-SMALL        │
+│  🟡 T1-MID    qwen2.5-coder:14b     localhost:11434  MODERATE-SMALL 9GB    │
 │  🟠 T1-CLOUD  qwen3-coder:480b-clou localhost:11434  MODERATE-LARGE        │
 │  🔵 T2-FLASH  gemini-2.5-flash      Google API       COMPLEX-FAST          │
 │  🔷 T2-PRO    gemini-2.5-pro        Google API       COMPLEX-DEEP          │
@@ -183,7 +183,7 @@ run_tier_graph()
     ▼
 ┌─ execute_node (one of 6) ─────────────────────────────────────────────────┐
 │  t1_local_node  → ChatOllama(qwen2.5-coder:7b,  localhost:11434)         │
-│  t1_mid_node    → ChatOllama(qwen3-coder:30b,    localhost:11434)         │
+│  t1_mid_node    → ChatOllama(qwen2.5-coder:14b,  localhost:11434)         │
 │  t1_cloud_node  → ChatOllama(qwen3-coder:480b-c, localhost:11434)         │
 │  t2_flash_node  → subprocess gemini -m gemini-2.5-flash                  │
 │  t2_pro_node    → subprocess gemini -m gemini-2.5-pro                    │
@@ -341,8 +341,9 @@ Imported by `langgraph_tier.py` → `classify_node`. No duplicate keyword lists 
 | v4.0 | 2026-03-04 | Native Tool Fraud patch, B-02/B-03/B-04 fixed |
 | v4.1 | 2026-03-04 | Header Precision Rules, B-05/B-07 fixed |
 | v5.1 | 2026-03-12 | 7 tiers, LangGraph, T1-MID, T2-KIMI, SQLite, LangSmith |
-| **v5.1+** | **2026-03-12** | **`_make_banners()` · Tier Task Progress Banner · Task Executed Tier Banner · all 7 tiers with icons · wired into execute_task() · mandated by tier-routing.md** |
+| v5.1+ | 2026-03-12 | `_make_banners()` · Tier Task Progress Banner · Task Executed Tier Banner · all 7 tiers with icons · wired into execute_task() · mandated by tier-routing.md |
+| **v6.1** | **2026-03-19** | **T1-MID: `qwen3-coder:30b` (cloud) → `qwen2.5-coder:14b` (local, 9GB) · T1-CLOUD: `qwen3-coder-next` → `qwen3-coder:480b-cloud` · TIER_CONFIG base corrected to OLLAMA_LOCAL · health check fixed · LangGraph re-verified (PASSED ✅) · dotfiles + CLAUDE.md + tier-routing.md synced** |
 
 ---
 
-*Architecture document for Claude-Tier-MacMini · v5.1+ · Mac Mini Apple Silicon · 2026-03-12 IST*
+*Architecture document for Claude-Tier-MacMini · v6.1 · Mac Mini Apple Silicon · 2026-03-19 IST*

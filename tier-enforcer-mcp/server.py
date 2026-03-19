@@ -112,8 +112,8 @@ MASTER_RULE = "execute_task(task, session_id, context)"
 # ── TIER CONFIG ───────────────────────────────────────────────────────
 TIER_CONFIG = {
     "T1-LOCAL":  {"model": "qwen2.5-coder:7b",      "role": "executor", "base": OLLAMA_LOCAL, "type": "ollama", "timeout": TIMEOUT_LOCAL,  "params": OLLAMA_PARAMS_LOCAL},
-    "T1-MID":    {"model": "qwen3-coder:30b",        "role": "executor", "base": OLLAMA_CLOUD, "type": "ollama", "timeout": TIMEOUT_MID,    "params": OLLAMA_PARAMS_CLOUD},
-    "T1-CLOUD":  {"model": "qwen3-coder-next",       "role": "executor", "base": OLLAMA_CLOUD, "type": "ollama", "timeout": TIMEOUT_CLOUD,  "params": OLLAMA_PARAMS_CLOUD},
+    "T1-MID":    {"model": "qwen2.5-coder:14b",       "role": "executor", "base": OLLAMA_LOCAL, "type": "ollama", "timeout": TIMEOUT_MID,    "params": OLLAMA_PARAMS_LOCAL},
+    "T1-CLOUD":  {"model": "qwen3-coder:480b-cloud",  "role": "executor", "base": OLLAMA_CLOUD, "type": "ollama", "timeout": TIMEOUT_CLOUD,  "params": OLLAMA_PARAMS_CLOUD},
     "T2-FLASH":  {"model": "gemini-2.5-flash",       "role": "analysis", "type": "gemini"},
     "T2-PRO":    {"model": "gemini-2.5-pro",         "role": "analysis", "type": "gemini"},
     "T2-KIMI":   {"model": "Qwen/Kimi-K2-Instruct",  "role": "analysis", "type": "huggingface"},
@@ -745,8 +745,8 @@ def tier_health_check(tier: str = "ALL") -> dict:
 
     checks = {
         "T1-LOCAL":  check_ollama(OLLAMA_LOCAL, "qwen2.5-coder:7b"),
-        "T1-MID":    check_ollama(OLLAMA_CLOUD, "qwen3-coder:30b"),
-        "T1-CLOUD":  check_ollama(OLLAMA_CLOUD, "qwen3-coder-next"),
+        "T1-MID":    check_ollama(OLLAMA_LOCAL, "qwen2.5-coder:14b"),
+        "T1-CLOUD":  check_ollama(OLLAMA_CLOUD, "qwen3-coder:480b-cloud"),
         "T2-FLASH":  check_gemini(),
         "T2-PRO":    check_gemini(),
         "T2-KIMI":   check_hf(),

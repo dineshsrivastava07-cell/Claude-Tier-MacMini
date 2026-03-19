@@ -43,8 +43,8 @@ Then print this banner filled with REAL results from those calls:
 ╠══════════════════════════════════════════════════════════════╣
 ║  🧠 BRAIN     Claude              plan only — never executes ║
 ║  ⚙️  EXECUTOR  T1-LOCAL            qwen2.5-coder:7b          ║
-║  ⚙️  EXECUTOR  T1-MID              qwen3-coder:30b           ║
-║  ⚙️  EXECUTOR  T1-CLOUD            qwen3-coder-next          ║
+║  ⚙️  EXECUTOR  T1-MID              qwen2.5-coder:14b         ║
+║  ⚙️  EXECUTOR  T1-CLOUD            qwen3-coder:480b-cloud    ║
 ║  🔍 ANALYSIS  T2-FLASH / T2-PRO   gemini (no execution)     ║
 ║  🔍 ANALYSIS  T2-KIMI             Kimi-K2 (no execution)    ║
 ╠══════════════════════════════════════════════════════════════╣
@@ -85,8 +85,8 @@ They are how the user knows which model actually ran.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   T1-LOCAL   qwen2.5-coder:7b    localhost:11434   EXECUTES
-  T1-MID     qwen3-coder:30b     cloud:11434       EXECUTES
-  T1-CLOUD   qwen3-coder-next    cloud:11434       EXECUTES
+  T1-MID     qwen2.5-coder:14b   localhost:11434   EXECUTES
+  T1-CLOUD   qwen3-coder:480b-cloud  localhost:11434   EXECUTES
   T2-FLASH   gemini-2.5-flash    Gemini CLI        ANALYSIS → T1-MID executes
   T2-PRO     gemini-2.5-pro      Gemini CLI        ANALYSIS → T1-MID executes
   T2-KIMI    Kimi-K2-Instruct    HuggingFace       ANALYSIS → T1-MID executes

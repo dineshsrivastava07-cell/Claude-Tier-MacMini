@@ -51,7 +51,7 @@ After auth completes → Claude CLI shell opens → THIS FILE LOADS → routing 
 ## ══════════════════════════════════════════════════════════════════
 
   T1-LOCAL  │ qwen2.5-coder:7b   │ Ollama local    │ SIMPLE
-  T1-MID    │ qwen3-coder:30b    │ Ollama cloud    │ MODERATE-SMALL
+  T1-MID    │ qwen2.5-coder:14b  │ Ollama local    │ MODERATE-SMALL
   T1-CLOUD  │ qwen3-coder:480b   │ Ollama cloud    │ MODERATE-LARGE
   T2-FLASH  │ gemini-2.5-flash   │ Gemini CLI      │ COMPLEX-FAST
   T2-PRO    │ gemini-2.5-pro     │ Gemini CLI      │ COMPLEX-DEEP
