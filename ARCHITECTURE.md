@@ -1,349 +1,289 @@
-# Architecture — Claude-Tier-MacMini 7-Tier AI Routing
+# DSR AI-Lab Tier Routing v9 — Architecture
 
-**Version:** v6.1 | **Platform:** Mac Mini (Apple Silicon, macOS) | **Updated:** 2026-03-19 IST
-**Status:** 7/7 tiers LIVE · LangGraph COMPILED · Progress & Execution Banners ACTIVE · T1-MID qwen2.5-coder:14b LOCAL
-
----
-
-## Design Philosophy
-
-> **"Always attempt the cheapest, fastest, local-first option. Escalate only on proven need. Show every routing decision visibly."**
-
-1. **Local-first** — Ollama (free, private) always before cloud
-2. **Quality-gated** — every tier output scored 0.0–1.0; escalate only if < 0.75
-3. **Hard-enforced** — LangGraph physically prevents T3 except for EPIC
-4. **Visible** — Tier Task Progress Banner + Task Executed Tier Banner on every task
-5. **Memory-aware** — short-term (session) and long-term (SQLite cross-session) inform routing
+**Version:** v9 | **Date:** 2026-03-22 | **Repo:** Claude-Tier-MacMini
 
 ---
 
-## Tier Task Progress & Execution Banners
+## System Overview
 
-`execute_task()` returns `progress_banner` and `execution_banner` on **every call**.
-The system prompt (`tier-routing.md`) mandates they are displayed verbatim.
+DSR AI-Lab Tier Routing is a dual-MCP AI orchestration system. Claude acts as **Brain only** — it classifies, plans, and routes. Ollama T1 models execute all code, file writes, and bash commands. T2 models (Gemini/Kimi) provide analysis that enriches T1 prompts — they never execute directly.
 
-### Banner Flow
+---
 
-```
-User sends task
-      │
-      ▼
- [DISPLAY progress_banner immediately]
- ╔══════════════════════════════════════════════════════════════════╗
- ║  ⚡ TIER ROUTING — TASK ASSIGNED                                  ║
- ╠══════════════════════════════════════════════════════════════════╣
- ║  Task         : <task description>                               ║
- ║  Complexity   : COMPLEX-FAST                                     ║
- ║  Tier         : 🔵  T2-FLASH                                      ║
- ║  Model        : gemini-2.5-flash                                 ║
- ║  API          : IN PROGRESS → Gemini CLI / Google API            ║
- ╚══════════════════════════════════════════════════════════════════╝
-      │
-      │  execute_task() → LangGraph runs (classify→gate→execute→quality→audit)
-      │
-      ▼
- [DISPLAY execution_banner after completion]
- ╔══════════════════════════════════════════════════════════════════╗
- ║  ✅  TASK EXECUTED — 🔵  T2-FLASH                                  ║
- ╠══════════════════════════════════════════════════════════════════╣
- ║  Model        : gemini-2.5-flash                                 ║
- ║  Quality      : 0.87 — PASS ✓                                    ║
- ║  Fallbacks    : 0 escalations                                    ║
- ║  Enforcement  : LANGGRAPH_HARD                                   ║
- ║  API          : YES → Gemini CLI / Google API ✓                  ║
- ╚══════════════════════════════════════════════════════════════════╝
-```
+## High-Level Architecture
 
-### All Banner States
+```mermaid
+graph TD
+    User([User Task]) --> ClaudeBrain[Claude CLI<br/>Brain Only<br/>Bash/Edit/Write DISABLED]
 
-```
-PASS (quality ≥ 0.75):
-  ✅  TASK EXECUTED — 🟢  T1-LOCAL  quality: 0.91 — PASS ✓  fallbacks: 0
-  ✅  TASK EXECUTED — 🟡  T1-MID    quality: 0.83 — PASS ✓  fallbacks: 0
-  ✅  TASK EXECUTED — 🟠  T1-CLOUD  quality: 0.78 — PASS ✓  fallbacks: 0
-  ✅  TASK EXECUTED — 🔵  T2-FLASH  quality: 0.87 — PASS ✓  fallbacks: 0
-  ✅  TASK EXECUTED — 🔷  T2-PRO    quality: 0.92 — PASS ✓  fallbacks: 0
-  ✅  TASK EXECUTED — 🟣  T2-KIMI   quality: 0.85 — PASS ✓  fallbacks: 0
-  ✅  TASK EXECUTED — 🔴  T3        quality: 0.95 — PASS ✓  fallbacks: 0
+    ClaudeBrain --> TierEnforcer[tier-enforcer-mcp<br/>Python / FastMCP 3.1.0<br/>LangGraph 8 Nodes]
+    ClaudeBrain --> TierRouter[tier-router-mcp<br/>TypeScript / Node 20+<br/>18 MCP Tools]
 
-ESCALATION (quality < 0.75):
-  ✅  TASK EXECUTED — 🟡  T1-MID (qwen2.5-coder:14b)  quality: 0.61 — FAIL ✗  fallbacks: 1
+    TierEnforcer --> T1L[T1-LOCAL<br/>qwen2.5-coder:7b<br/>Ollama local 4.7GB]
+    TierEnforcer --> T1M[T1-MID<br/>qwen2.5-coder:14b<br/>Ollama local 9.0GB]
+    TierEnforcer --> T1C[T1-CLOUD<br/>qwen3-coder:480b-cloud<br/>Ollama cloud]
+    TierEnforcer --> T2F[T2-FLASH<br/>gemini-2.5-flash<br/>Analysis only]
+    TierEnforcer --> T2P[T2-PRO<br/>gemini-2.5-pro<br/>Analysis only]
+    TierEnforcer --> T2K[T2-KIMI<br/>Kimi-K2-Instruct<br/>Analysis only]
 
-T3 BLOCKED (non-EPIC hits T3 gate):
-  🚫  T3 BLOCKED — complexity: SIMPLE
-      Reason: T3 is EPIC only — T3 gate returned BLOCKED
-```
+    T2F -->|enriched prompt| T1M
+    T2P -->|enriched prompt| T1M
+    T2K -->|enriched prompt| T1M
 
-### `_make_banners()` Implementation
+    TierRouter --> T1L
+    TierRouter --> T1C
+    TierRouter --> T2F
+    TierRouter --> T2P
 
-Located in `tier-enforcer-mcp/server.py`:
-
-```python
-_TIER_META = {
-    "T1-LOCAL": {"model": "qwen2.5-coder:7b",        "api": "localhost:11434/api/chat", "icon": "🟢"},
-    "T1-MID":   {"model": "qwen2.5-coder:14b",         "api": "localhost:11434/api/chat", "icon": "🟡"},
-    "T1-CLOUD": {"model": "qwen3-coder:480b-cloud",   "api": "localhost:11434/api/chat", "icon": "🟠"},
-    "T2-FLASH": {"model": "gemini-2.5-flash",         "api": "Gemini CLI / Google API",  "icon": "🔵"},
-    "T2-PRO":   {"model": "gemini-2.5-pro",           "api": "Gemini CLI / Google API",  "icon": "🔷"},
-    "T2-KIMI":  {"model": "Kimi-K2-Instruct",         "api": "HuggingFace API",          "icon": "🟣"},
-    "T3":       {"model": "claude-sonnet-4-6",        "api": "Anthropic (Claude direct)","icon": "🔴"},
-}
-
-def _make_banners(task, tier, complexity, quality, fallback_count,
-                  enforcement, t3_blocked=False, t3_reason="") -> dict:
-    # Returns: {"progress_banner": str, "execution_banner": str}
-    # progress_banner  → shown BEFORE execute_task fires
-    # execution_banner → shown AFTER execute_task returns
-```
-
-**`execute_task()` return payload includes:**
-```python
-{
-    "enforcement":      "LANGGRAPH_HARD",
-    "tier":             "T2-FLASH",
-    "complexity":       "COMPLEX-FAST",
-    "quality_score":    0.87,
-    "fallback_count":   0,
-    "t3_approved":      False,
-    "chain_exhausted":  False,
-    "result":           "<model output>",
-    "graph_nodes":      ["classify", "t2_flash", "quality", "audit"],
-    "progress_banner":  "╔══...⚡ TIER ROUTING — TASK ASSIGNED...╝",
-    "execution_banner": "╔══...✅ TASK EXECUTED — 🔵 T2-FLASH...╝",
-}
+    style ClaudeBrain fill:#4a4a8a,color:#fff
+    style TierEnforcer fill:#2d6a4f,color:#fff
+    style TierRouter fill:#1d3557,color:#fff
+    style T1L fill:#457b9d,color:#fff
+    style T1M fill:#457b9d,color:#fff
+    style T1C fill:#e63946,color:#fff
+    style T2F fill:#f4a261,color:#000
+    style T2P fill:#f4a261,color:#000
+    style T2K fill:#f4a261,color:#000
 ```
 
 ---
 
-## Component Map
+## LangGraph State Machine (8 Nodes)
 
+```mermaid
+flowchart LR
+    A([Task Input]) --> B[classify]
+    B --> C[skill_selector]
+    C --> D[claude_brain]
+    D --> E[prewarm_check]
+
+    E --> F{Route?}
+    F -->|T2 path| G[t2_analysis<br/>Gemini / Kimi]
+    F -->|T1 path| H[t1_execute<br/>Ollama]
+
+    G --> H
+    H --> I[escalate]
+    I -->|score OK| J[audit]
+    I -->|score low| H
+    J --> K([END])
+
+    style A fill:#555,color:#fff
+    style K fill:#555,color:#fff
+    style D fill:#4a4a8a,color:#fff
+    style G fill:#f4a261,color:#000
+    style H fill:#457b9d,color:#fff
+    style I fill:#e63946,color:#fff
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                 CLAUDE-TIER-MACMINI v5.1+ — COMPONENT MAP                  │
-│                                                                             │
-│  ACTIVATION LAYER                                                           │
-│  ~/.zshrc → claude() → --append-system-prompt tier-routing.md (v5.1)       │
-│  SessionStart hook → pre-flight banner → Ollama/Gemini health check        │
-│                                                                             │
-│  ENFORCEMENT LAYER                                                          │
-│  ┌───────────────────────────────────┐  ┌───────────────────────────────┐  │
-│  │  tier-enforcer-mcp (Python)       │  │  tier-router-mcp (TypeScript) │  │
-│  │  execute_task() → LangGraph       │  │  18 tools · 3 resources       │  │
-│  │  _make_banners() → banners        │  │  routing/T1/T2/T3/pipelines   │  │
-│  └───────────────────────────────────┘  └───────────────────────────────┘  │
-│                                                                             │
-│  EXECUTION LAYER                                                            │
-│  🟢 T1-LOCAL  qwen2.5-coder:7b      localhost:11434  SIMPLE                │
-│  🟡 T1-MID    qwen2.5-coder:14b     localhost:11434  MODERATE-SMALL 9GB    │
-│  🟠 T1-CLOUD  qwen3-coder:480b-clou localhost:11434  MODERATE-LARGE        │
-│  🔵 T2-FLASH  gemini-2.5-flash      Google API       COMPLEX-FAST          │
-│  🔷 T2-PRO    gemini-2.5-pro        Google API       COMPLEX-DEEP          │
-│  🟣 T2-KIMI   Kimi-K2-Instruct      HuggingFace API  COMPLEX-REASON        │
-│  🔴 T3        claude-sonnet-4-6     Anthropic        EPIC ONLY (gated)     │
-│                                                                             │
-│  OBSERVABILITY LAYER                                                        │
-│  LangSmith → smith.langchain.com/project/dsr-ai-lab-tier-routing           │
-│  Routing Log → ~/.tier-enforcer/routing.log (JSONL)                        │
-│  Memory DB  → ~/.tier-enforcer/memory.db (SQLite, STM + LTM)               │
-│  Banners    → progress_banner + execution_banner in every execute_task()   │
-└─────────────────────────────────────────────────────────────────────────────┘
+
+| Node | Responsibility |
+|------|---------------|
+| `classify` | Keyword scan → assign tier (T1-LOCAL / T1-MID / T1-CLOUD / T2-FLASH / T2-PRO / T2-KIMI) |
+| `skill_selector` | Load domain skill file into context (retail-analytics, cybersecurity, etc.) |
+| `claude_brain` | Claude writes execution plan — runs for **every** tier, no exceptions |
+| `prewarm_check` | Verify 7b + 14b models are loaded in Ollama RAM |
+| `t2_analysis` | Gemini-flash / Gemini-pro / Kimi-K2 analyzes task, returns structured analysis |
+| `t1_execute` | Ollama runs task using T1 model + claude_brain plan + optional T2 analysis |
+| `escalate` | If quality score < threshold → bump to next tier (max 2 fallbacks) |
+| `audit` | Write row to `routing_log` (11 cols: ts, session, task, classified_tier, executor_tier, model, score, ok, elapsed, skills, brain_used) |
+
+---
+
+## Task Classification Flow
+
+```mermaid
+flowchart TD
+    Task([Incoming Task]) --> KW{Keyword Scan}
+
+    KW -->|debug / error / failing / broken / traceback| TF[T2-FLASH]
+    KW -->|analyze / explain / review / assess| TP[T2-PRO]
+    KW -->|reason / infer / logic / deduce| TK[T2-KIMI]
+    KW -->|greenfield / epic / full platform / complete system| TC[T1-CLOUD]
+    KW -->|moderate / write module / implement feature| TM[T1-MID]
+    KW -->|simple / rename / fix typo / utility| TL[T1-LOCAL]
+
+    TF -->|analysis| TM2[T1-MID executes]
+    TP -->|analysis| TM2
+    TK -->|analysis| TM2
+    TC --> OC[Ollama qwen3-coder:480b-cloud]
+    TM --> OM[Ollama qwen2.5-coder:14b]
+    TL --> OL[Ollama qwen2.5-coder:7b]
+
+    style TF fill:#f4a261,color:#000
+    style TP fill:#f4a261,color:#000
+    style TK fill:#f4a261,color:#000
+    style TC fill:#e63946,color:#fff
+    style TM fill:#457b9d,color:#fff
+    style TL fill:#457b9d,color:#fff
+    style OC fill:#e63946,color:#fff
+    style OM fill:#457b9d,color:#fff
+    style OL fill:#457b9d,color:#fff
 ```
 
 ---
 
-## LangGraph Enforcement Graph (Full Flow with Banners)
+## Intercept / Hook Flow (Edit/Write Protection)
 
-```
-User Task
-    │
-    ▼
-execute_task(task, session_id)
-    │
-    │ [progress_banner generated from classify result — displayed before execution]
-    │
-    ▼
-run_tier_graph()
-    │
-    ▼
-┌─ classify_node ──────────────────────────────────────────────────────────┐
-│  HARD GATE 1 — always first, cannot be skipped                          │
-│  Reads ROUTING_RULES from server.py (single source of truth)            │
-│  Assigns: complexity + tier                                             │
-│  Enriches: context with STM (last 3 session tasks) + LTM (SQLite)      │
-│  Logs: audit_log entry {node: classify, complexity, tier, layer: L2}   │
-└──────────────────────────────────┬───────────────────────────────────────┘
-                                   │ conditional edge → execution node or t3_gate
-    ┌──────────────────────────────▼──────────────────────────────────────┐
-    │  EPIC? → t3_gate_node                                               │
-    │           APPROVED (EPIC or chain exhausted) → audit               │
-    │           BLOCKED (not EPIC) → 🚫 T3 BLOCKED banner → audit        │
-    └─────────────────────────────────────────────────────────────────────┘
-    │
-    │  T1/T2 tasks:
-    ▼
-┌─ execute_node (one of 6) ─────────────────────────────────────────────────┐
-│  t1_local_node  → ChatOllama(qwen2.5-coder:7b,  localhost:11434)         │
-│  t1_mid_node    → ChatOllama(qwen2.5-coder:14b,  localhost:11434)         │
-│  t1_cloud_node  → ChatOllama(qwen3-coder:480b-c, localhost:11434)         │
-│  t2_flash_node  → subprocess gemini -m gemini-2.5-flash                  │
-│  t2_pro_node    → subprocess gemini -m gemini-2.5-pro                    │
-│  t2_kimi_node   → InferenceClient(Kimi-K2-Instruct, HF token)            │
-│                                                                           │
-│  All nodes: state.result = output, state.quality_score = _score_quality  │
-└───────────────────────────────────────┬───────────────────────────────────┘
-                                        │ → quality gate (mandatory)
-    ┌───────────────────────────────────▼───────────────────────────────────┐
-    │  quality_gate_node                                                    │
-    │  score ≥ 0.75  → PASS → audit                                        │
-    │  score < 0.75  → ESCALATE → next tier in fallback chain              │
-    │  at T2-KIMI and still failing → chain_exhausted=True → T3 gate       │
-    └───────────────────────────────────┬───────────────────────────────────┘
-                                        │
-    ┌───────────────────────────────────▼───────────────────────────────────┐
-    │  audit_node                                                           │
-    │  → routing.log (JSONL): tier, quality, fallback_count, timestamp     │
-    │  → memory.db (SQLite): long_term_memory INSERT                       │
-    │  → STM update: short_term_memory[-10:]                               │
-    │  → LangSmith: trace recorded                                         │
-    └───────────────────────────────────┬───────────────────────────────────┘
-                                        │
-                                        ▼
-                                       END
-    │
-    ▼
-_make_banners(tier, complexity, quality, fallback_count, enforcement)
-    │
-    ├── progress_banner  (tier assignment — IN PROGRESS)
-    └── execution_banner (result — PASS ✓ / FAIL ✗ / 🚫 BLOCKED)
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant C as Claude Brain
+    participant H as PreToolUse Hook
+    participant I as intercept.py
+    participant O as Ollama T1
+    participant FS as File System
 
-execute_task() returns full payload including both banners
+    U->>C: Give me a task
+    C->>C: Plan with claude_brain
+    C->>H: Attempt Edit/Write/MultiEdit
+
+    H->>I: Intercept triggered
+    I->>I: tool_name in OLLAMA_TOOLS?
+
+    alt Bash command
+        I-->>H: continue: true (passthrough)
+        H-->>C: native execution
+    else Edit / Write / MultiEdit / NotebookEdit
+        I->>O: POST /api/generate (task description)
+        O->>I: generated file content
+        I->>FS: Write file
+        I-->>H: continue: false (Claude blocked)
+    end
 ```
+
+**Bash is native passthrough.** Edit/Write/MultiEdit/NotebookEdit always go through Ollama — Claude physically cannot write files directly.
 
 ---
 
-## Fallback Chain with Banner States
+## Fallback / Escalation Chain
 
+```mermaid
+flowchart LR
+    TL[T1-LOCAL<br/>threshold 0.45] -->|score low| TM
+    TM[T1-MID<br/>threshold 0.55] -->|score low| TC
+    TC[T1-CLOUD<br/>threshold 0.60] -->|score low| TF
+    TF[T2-FLASH<br/>threshold 0.50] -->|score low| TP
+    TP[T2-PRO<br/>threshold 0.50] -->|score low| TK
+    TK[T2-KIMI<br/>threshold 0.50] -->|max fallbacks| END([Stop])
+
+    style TL fill:#457b9d,color:#fff
+    style TM fill:#457b9d,color:#fff
+    style TC fill:#e63946,color:#fff
+    style TF fill:#f4a261,color:#000
+    style TP fill:#f4a261,color:#000
+    style TK fill:#f4a261,color:#000
 ```
-T1-LOCAL  → quality ≥ 0.75 → ✅ TASK EXECUTED — 🟢 T1-LOCAL  PASS ✓
-              quality < 0.75 → ✅ TASK EXECUTED — 🟢 T1-LOCAL  FAIL ✗  escalating...
-                  │
-                  ▼
-            T1-MID  → quality ≥ 0.75 → ✅ TASK EXECUTED — 🟡 T1-MID  PASS ✓
-              quality < 0.75 → escalate...
-                  │
-                  ▼
-            T1-CLOUD → quality ≥ 0.75 → ✅ TASK EXECUTED — 🟠 T1-CLOUD  PASS ✓
-              quality < 0.75 → escalate...
-                  │
-                  ▼
-            T2-FLASH → quality ≥ 0.75 → ✅ TASK EXECUTED — 🔵 T2-FLASH  PASS ✓
-              quality < 0.75 → escalate...
-                  │
-                  ▼
-            T2-PRO  → quality ≥ 0.75 → ✅ TASK EXECUTED — 🔷 T2-PRO  PASS ✓
-              quality < 0.75 → escalate...
-                  │
-                  ▼
-            T2-KIMI → quality ≥ 0.75 → ✅ TASK EXECUTED — 🟣 T2-KIMI  PASS ✓
-              quality < 0.75 → chain_exhausted=True
-                  │
-                  ▼
-            T3 GATE → approved (chain exhausted)
-                  │
-                  ▼
-            ✅ TASK EXECUTED — 🔴 T3  PASS ✓
+
+Max fallbacks per task: **2**. Quality scores written to `routing_log` for every attempt.
+
+---
+
+## Session Startup Sequence
+
+```mermaid
+sequenceDiagram
+    participant T as Terminal / zshrc
+    participant O as Ollama
+    participant W as Watchdog
+    participant C as Claude CLI
+    participant K as macOS Keychain
+    participant MCP as tier-enforcer-mcp
+
+    T->>O: GET /api/ps (are models loaded?)
+    alt Models cold
+        T->>O: POST /api/generate keep_alive=-1 (7b + 14b)
+        O-->>T: Models in RAM
+    else Models warm
+        T-->>T: Skip prewarm (guard exits)
+    end
+
+    T->>W: Start watchdog (single instance guard)
+    W->>MCP: Start server.py (FastMCP)
+
+    T->>C: claude (user invokes)
+    C->>K: Read "Claude Code-credentials"
+    K-->>C: OAuth token sk-ant-oat01-...
+    C->>C: Load settings.json (22 MCP servers + hooks)
+    C->>C: Load CLAUDE.md (brain protocol v8)
+
+    C->>MCP: activate_tier_routing(session_id)
+    MCP->>MCP: Compile LangGraph 8 nodes
+    MCP-->>C: OK — LangGraph ready
+
+    C->>MCP: tier_health_check(tier=ALL)
+    MCP-->>C: Tier status map
+
+    C->>MCP: prewarm_models()
+    MCP->>O: Verify 7b + 14b in RAM
+    MCP-->>C: Models confirmed warm
+
+    C->>C: Show STARTUP BANNER (live data)
 ```
 
 ---
 
-## Two-Layer Activation Model
+## Database Schema (`routing_log`)
 
-```
-LAYER 1: OAuth (pre-MCP — banners NOT applicable)
-  ┌──────────────────────────────────────────────────────────────────┐
-  │ Process-level auth before Claude CLI shell opens                │
-  │ MCP tools / tier-routing.md / banners do NOT exist yet          │
-  │ LAYER_1_AUTH_BYPASS = True (hardcoded in server.py)             │
-  └──────────────────────────────────────────────────────────────────┘
-                  │ auth completes
-                  ▼
-LAYER 2: Task routing — banners ACTIVE on every task
-  ┌──────────────────────────────────────────────────────────────────┐
-  │ Claude CLI shell opens                                          │
-  │ tier-routing.md injected → BANNER DISPLAY RULES loaded         │
-  │ SessionStart hook fires → pre-flight banner                    │
-  │ tier-enforcer-mcp auto-connects → execute_task() registered    │
-  │                                                                 │
-  │ Every user task:                                                │
-  │   1. Show progress_banner (tier assigned, IN PROGRESS)         │
-  │   2. execute_task() → LangGraph runs                           │
-  │   3. Show execution_banner (PASS ✓ / FAIL ✗ / 🚫 BLOCKED)     │
-  └──────────────────────────────────────────────────────────────────┘
+```sql
+CREATE TABLE routing_log (
+    ts              TEXT,       -- ISO timestamp (IST)
+    session         TEXT,       -- session UUID
+    task            TEXT,       -- task description (first 200 chars)
+    classified_tier TEXT,       -- e.g. T2-FLASH (what classifier chose)
+    executor_tier   TEXT,       -- actual executing tier (e.g. T1-MID)
+    model           TEXT,       -- model name used for execution
+    score           REAL,       -- quality score 0.0-1.0
+    ok              INTEGER,    -- 1=success, 0=failure
+    elapsed         REAL,       -- total seconds elapsed
+    skills          TEXT,       -- JSON array of matched skill names
+    brain_used      INTEGER     -- 1=claude_brain ran, 0=skipped
+);
 ```
 
 ---
 
-## Routing Rules (server.py — single source of truth)
+## v9 vs v8 Diff
 
-```python
-ROUTING_RULES = {
-  "EPIC":           tier=T3,        keywords=[greenfield, new platform, full system...]
-  "COMPLEX-REASON": tier=T2-KIMI,   keywords=[math, statistic, algorithm, bayesian...]
-  "COMPLEX-DEEP":   tier=T2-PRO,    keywords=[architecture, security audit, rca...]
-  "COMPLEX-FAST":   tier=T2-FLASH,  keywords=[debug, fix bug, refactor, multi-file...]
-  "MODERATE-LARGE": tier=T1-CLOUD,  keywords=[feature set, pipeline, new module...]
-  "MODERATE-SMALL": tier=T1-MID,    keywords=[implement, create feature, new class...]
-  "SIMPLE":         tier=T1-LOCAL,  keywords=[] (default catch-all)
-}
-```
-
-Imported by `langgraph_tier.py` → `classify_node`. No duplicate keyword lists anywhere.
-
----
-
-## Full Routing Matrix
-
-| Task Type | SIMPLE 🟢 | MOD-SM 🟡 | MOD-LG 🟠 | CMPLX-F 🔵 | CMPLX-D 🔷 | CMPLX-R 🟣 | EPIC 🔴 |
-|-----------|-----------|-----------|-----------|-----------|-----------|-----------|---------|
-| CODE_GEN | T1-LOCAL | T1-MID | T1-CLOUD | T2-FLASH | T2-PRO | T2-KIMI | T3 |
-| CODE_FIX | T1-LOCAL | T1-MID | T1-CLOUD | T2-FLASH | T2-PRO | T2-KIMI | T3 |
-| REFACTOR | T1-LOCAL | T1-MID | T1-CLOUD | T2-FLASH | T2-PRO | T2-KIMI | T3 |
-| DEBUG | T1-LOCAL | T1-MID | T1-CLOUD | T2-FLASH | T2-PRO | T2-KIMI | T3 |
-| MATH/ALGO | T1-LOCAL | T1-MID | T1-CLOUD | T2-FLASH | T2-PRO | T2-KIMI | T3 |
-| ARCHITECTURE | T1-LOCAL | T1-MID | T1-CLOUD | T2-FLASH | T2-PRO | T2-KIMI | T3 |
-| **Catch-all** | T1-LOCAL | T1-MID | T1-CLOUD | T2-FLASH | T2-PRO | T2-KIMI | T3 |
+| Aspect | v8 | v9 |
+|--------|----|----|
+| Tiers | T1-LOCAL, T1-MID, T1-CLOUD, T2-FLASH, T2-PRO, T2-KIMI, **T3-EPIC** | T1-LOCAL, T1-MID, T1-CLOUD, T2-FLASH, T2-PRO, T2-KIMI |
+| Epic routing | T3-EPIC → blueprint → T1-CLOUD | **T1-CLOUD directly** |
+| LangGraph nodes | 9 (included `t3_plan`) | **8** (`t3_plan` removed) |
+| `claude_brain` | Ran for every tier | Ran for every tier (same — T3-EPIC was redundant) |
+| `MODEL_T1_CLOUD` | `qwen3-coder:480b` | **`qwen3-coder:480b-cloud`** (fixed) |
+| `keep_alive` | 7b + 14b only | **7b + 14b + 480b-cloud** |
+| DB columns | 8 | **11** (+ elapsed, skills, brain_used) |
+| Auth | ANTHROPIC_API_KEY env var | **OAuth macOS Keychain only** |
+| Prewarm | Fires every terminal open | **Guarded: checks /api/ps first** |
+| Watchdog instances | Multiple could accumulate | **Single instance enforced** |
 
 ---
 
-## Security Model
+## Deployed Files
 
-| Layer | Mechanism | Covers |
-|-------|-----------|--------|
-| System Prompt | `tier-routing.md` · BANNER DISPLAY RULES | Routing + banner enforcement |
-| LangGraph | 5-node compiled graph | T3 physically unreachable unless EPIC |
-| MCP Gate | `t3_gate_node` · `t3_epic_gate()` | Hard block with reason + banner |
-| Quality Gate | threshold 0.75 | Low-quality escalation + banner FAIL state |
-| Audit Log | `routing.log` (JSONL) | Every decision: tier, quality, timestamp |
-| SQLite Memory | `memory.db` | Cross-session routing history |
-| LangSmith | All traces | Full observability |
-| Budget Caps | `T3_MONTHLY_TOKEN_CAP=50000` | T3 spending control |
-| Ollama Local | T1 models on localhost | No data leaves machine for T1 |
-
----
-
-## Version Evolution
-
-| Version | Date | Change |
-|---------|------|--------|
-| v1.0 | 2026-02 | TypeScript MCP server, 4-tier concept |
-| v2.0 | 2026-02 | Base routing prompt, skill layer |
-| v3.0 | 2026-03-02 | SIMPLE→T1-LOCAL strict, B-01/B-06 fixed |
-| v4.0 | 2026-03-04 | Native Tool Fraud patch, B-02/B-03/B-04 fixed |
-| v4.1 | 2026-03-04 | Header Precision Rules, B-05/B-07 fixed |
-| v5.1 | 2026-03-12 | 7 tiers, LangGraph, T1-MID, T2-KIMI, SQLite, LangSmith |
-| v5.1+ | 2026-03-12 | `_make_banners()` · Tier Task Progress Banner · Task Executed Tier Banner · all 7 tiers with icons · wired into execute_task() · mandated by tier-routing.md |
-| **v6.1** | **2026-03-19** | **T1-MID: `qwen3-coder:30b` (cloud) → `qwen2.5-coder:14b` (local, 9GB) · T1-CLOUD: `qwen3-coder-next` → `qwen3-coder:480b-cloud` · TIER_CONFIG base corrected to OLLAMA_LOCAL · health check fixed · LangGraph re-verified (PASSED ✅) · dotfiles + CLAUDE.md + tier-routing.md synced** |
+| File | Purpose |
+|------|---------|
+| `tier-enforcer/server.py` | FastMCP 3.1.0, LangGraph 8 nodes, 11-col DB |
+| `tier-enforcer/intercept.py` | PreToolUse hook — Edit/Write → Ollama |
+| `tier-enforcer/watchdog.sh` | Single-instance watchdog, auto-restart |
+| `src/core/router.ts` | TypeScript tier routing engine |
+| `src/tiers/t2-gemini.ts` | T2 Gemini tier (separate instances per model) |
+| `~/.claude/CLAUDE.md` | Brain protocol v8 — 3 startup calls, 4 banners |
+| `~/.claude/settings.json` | Hooks + 22 MCP servers |
+| `~/.zshrc` | Guarded prewarm + watchdog guard |
+| `~/.tier-enforcer/memory.db` | SQLite routing_log (11 cols) |
 
 ---
 
-*Architecture document for Claude-Tier-MacMini · v6.1 · Mac Mini Apple Silicon · 2026-03-19 IST*
+## Constraint Summary
+
+| Rule | What it means |
+|------|--------------|
+| RULE 1 | Bash/Edit/Write/MultiEdit disabled for Claude globally |
+| RULE 2 | Every task goes through `execute_task()` MCP tool |
+| RULE 5 | Epic tasks → T1-CLOUD directly — T3-EPIC does not exist in v9 |
+| RULE 6 | T2 = analysis only; T1 = all execution |
+| RULE 7 | tier-enforcer offline → HARD STOP, Claude refuses all tasks |
+
+---
+
+*DSR AI-Lab — Mac Mini — Architecture v9 — 2026-03-22*
