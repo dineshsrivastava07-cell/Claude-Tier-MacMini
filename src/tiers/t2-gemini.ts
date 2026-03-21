@@ -11,14 +11,15 @@ type GeminiSubModel = "gemini-2.5-pro" | "gemini-2.5-flash" | "gemini-2.5-flash-
 /** T2 — Gemini via google-generativeai SDK (API key) OR gemini CLI (account auth). */
 export class T2GeminiTier extends BaseTier {
   readonly tierName: TierName = "T2-PRO";
-  readonly modelId  = "gemini-2.5-pro";
+  readonly modelId: string;
 
   private readonly timeout: number;
   private readonly useApiKey: boolean;
   private sdkClients: Map<GeminiSubModel, unknown> = new Map();
 
-  constructor() {
+  constructor(modelId: string = "gemini-2.5-pro") {
     super();
+    this.modelId   = modelId;
     this.timeout   = Number(process.env.T2_TIMEOUT_MS ?? 60_000);
     this.useApiKey = !!(process.env.GEMINI_API_KEY);
 

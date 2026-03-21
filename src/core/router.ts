@@ -28,15 +28,17 @@ export class TierRouter {
 
     const t1l  = new T1LocalTier();
     const t1c  = new T1CloudTier();
-    const t2   = new T2GeminiTier();
+    const t2pro   = new T2GeminiTier("gemini-2.5-pro");
+    const t2flash = new T2GeminiTier("gemini-2.5-flash");
+    const t2lite  = new T2GeminiTier("gemini-2.5-flash-lite");
     const t3   = new T3ClaudeTier();
 
     this.tiers = new Map<TierName, BaseTier>();
     this.tiers.set("T1-LOCAL", t1l);
     this.tiers.set("T1-CLOUD", t1c);
-    this.tiers.set("T2-PRO",   t2);   // same client, different model variant
-    this.tiers.set("T2-FLASH", t2);
-    this.tiers.set("T2-LITE",  t2);
+    this.tiers.set("T2-PRO",   t2pro);
+    this.tiers.set("T2-FLASH", t2flash);
+    this.tiers.set("T2-LITE",  t2lite);
     this.tiers.set("T3",       t3);
   }
 
