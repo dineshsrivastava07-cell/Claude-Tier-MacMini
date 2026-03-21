@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """
-DSR AI-LAB TOOL INTERCEPTION HOOK v8.3
+DSR AI-LAB TOOL INTERCEPTION HOOK v9
 File: ~/tier-enforcer-mcp/intercept.py
 
-DESIGN RULE (v8.3):
-  Bash = NEVER intercepted. Always continue=True.
-  The hook matcher in settings.json does NOT include Bash.
-  This file only handles: Edit, Write, MultiEdit, NotebookEdit.
+v9 PERMANENT FIX — path-based intercept logic:
+  Look at WHAT FILE is being modified, not just which tool.
+  ~/.claude/           = Claude CLI internal  = ALWAYS passthrough
+  ~/tier-enforcer-mcp/ = MCP server files     = ALWAYS passthrough
+  ~/tier-router-mcp/   = tier-router files    = ALWAYS passthrough
+  ~/.tier-enforcer/    = routing DB/logs      = ALWAYS passthrough
+  /tmp/, /var/, /usr/  = system paths         = ALWAYS passthrough
+  Everything else      = user project         = intercept to Ollama
 
-If Bash ever reaches this file (e.g. future config change),
-it still passes through immediately.
+  No list to maintain. No regex to break. Based on file ownership.
+
+PREVIOUS BROKEN APPROACHES (v8.x):
+  v8.0: Bash|Edit|Write in matcher     → stopped ALL Bash
+  v8.1: Passthrough list               → list always incomplete
+  v8.2: Default passthrough            → still blocked some Bash
+  v8.3: Bash excluded from matcher     → Edit on ~/.claude/ still blocked
 
 FLOW:
-  Edit/Write/MultiEdit -> route to Ollama T1 tier
-  Everything else      -> continue=True (pass through)
+  Edit/Write/MultiEdit on user project → route to Ollama T1 tier
+  Edit/Write/MultiEdit on internal paths → continue=True passthrough
+  Bash + everything else               → continue=True passthrough
 """
 
 import sys
@@ -33,7 +43,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(message)s"
 )
-log = logging.getLogger("intercept-v8.3")
+log = logging.getLogger("intercept-v9")
 
 OLLAMA_LOCAL = os.environ.get("OLLAMA_LOCAL_HOST", "http://localhost:11434")
 OLLAMA_CLOUD = os.environ.get("OLLAMA_CLOUD_HOST", "http://localhost:11434")
@@ -56,9 +66,30 @@ MODELS = {
     },
 }
 
-# Only these tools are routed to Ollama.
-# Bash is NOT here. Bash always passes through natively.
+# Only these tools are candidates for interception.
+# Bash is NOT here — Bash always passes through natively.
 OLLAMA_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+
+# Internal paths that must NEVER be intercepted.
+# These are Claude CLI config files and MCP infrastructure.
+INTERNAL_PATHS = [
+    os.path.join(HOME, ".claude"),            # CLAUDE.md, settings.json, etc.
+    os.path.join(HOME, "tier-enforcer-mcp"),  # MCP server files
+    os.path.join(HOME, "tier-router-mcp"),    # tier-router MCP files
+    os.path.join(HOME, ".tier-enforcer"),     # routing DB, logs
+    "/tmp",                                    # temp files
+    "/var/",                                   # system files
+    "/usr/",                                   # system files
+]
+
+
+def is_internal_path(file_path: str) -> bool:
+    """Return True if file_path is a Claude CLI / MCP internal file."""
+    expanded = os.path.expanduser(file_path) if file_path else ""
+    for internal in INTERNAL_PATHS:
+        if expanded.startswith(internal):
+            return True
+    return False
 
 
 def passthrough():
@@ -207,7 +238,24 @@ def main():
         passthrough()
         return
 
-    # Route file modification to Ollama
+    # v9 PATH-BASED FILTER: Never intercept Claude CLI / MCP internal files
+    file_path = (
+        tool_input.get("path", "")
+        or tool_input.get("file_path", "")
+        or ""
+    )
+    if is_internal_path(file_path):
+        log.info("PASSTHROUGH internal=%s tool=%s", file_path[:80], tool_name)
+        passthrough()
+        return
+
+    # No file path at all — pass through (safety)
+    if not file_path:
+        log.info("PASSTHROUGH no-path tool=%s", tool_name)
+        passthrough()
+        return
+
+    # Route user project file modification to Ollama
     tier    = pick_tier(tool_name, tool_input)
     cfg     = MODELS[tier]
     model   = cfg["model"]
@@ -215,7 +263,7 @@ def main():
     timeout = cfg["timeout"]
     prompt  = make_prompt(tool_name, tool_input)
 
-    log.info("INTERCEPT tool=%s tier=%s model=%s", tool_name, tier, model)
+    log.info("INTERCEPT tool=%s file=%s tier=%s model=%s", tool_name, file_path[:60], tier, model)
 
     result  = call_ollama(model, base, prompt, timeout)
     elapsed = round(time.time() - t_start, 1)

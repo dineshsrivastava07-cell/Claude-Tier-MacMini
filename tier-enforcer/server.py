@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DSR AI-LAB TIER ENFORCER v8 FINAL
+DSR AI-LAB TIER ENFORCER v9
 File: ~/tier-enforcer-mcp/server.py
 
 ARCHITECTURE:
@@ -8,11 +8,11 @@ ARCHITECTURE:
   intercept = Bash/Edit/Write -> intercept.py -> Ollama
   T1-LOCAL  = qwen2.5-coder:7b  (4.7GB localhost, simple/fast)
   T1-MID    = qwen2.5-coder:14b (9.0GB localhost, complex)
-  T1-CLOUD  = qwen3-coder:480b  (cloud, epic)
+  T1-CLOUD  = qwen3-coder:480b  (cloud, epic — T3-EPIC removed)
   T2-*      = analysis only -> enriches T1 prompt
   (epic tasks auto-route to T1-CLOUD — claude_brain plans all tasks)
 
-LANGGRAPH v8 NODES:
+LANGGRAPH v9 NODES (8):
   classify -> skill_selector -> claude_brain -> prewarm_check
   -> [t2_analysis | t1_execute]
   -> escalate (STATE NODE) -> audit -> END
@@ -50,7 +50,7 @@ os.makedirs(DB_DIR, exist_ok=True)
 
 logging.basicConfig(filename=LOG_PATH, level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("tier-v8")
+log = logging.getLogger("tier-v9")
 
 OLLAMA_LOCAL  = os.environ.get("OLLAMA_LOCAL_HOST", "http://localhost:11434")
 OLLAMA_CLOUD  = os.environ.get("OLLAMA_CLOUD_HOST", "http://localhost:11434")
@@ -293,7 +293,7 @@ def _node_classify(s):
 
 
 def _node_skill_selector(s):
-    """v8 NEW — reads ~/.claude/skills/*.md files for relevant skills."""
+    """v9 — reads ~/.claude/skills/*.md files for relevant skills."""
     sc,mcps,snames=_select_skills(s["task"])
     s["skill_content"]=sc; s["mcp_servers"]=mcps; s["skill_names"]=snames
     if snames: log.info("SKILLS selected=%s mcps=%s",snames,mcps)
@@ -301,7 +301,7 @@ def _node_skill_selector(s):
 
 
 def _node_claude_brain(s):
-    """v8 NEW — Claude reasons, decomposes, plans. Never executes."""
+    """v9 — Claude reasons, decomposes, plans. Never executes."""
     task=s["task"]; tier=s["classified_tier"]
     prompt=(
         "TASK ANALYSIS AND EXECUTION PLANNING\n\nTask: "+task+"\n\n"
@@ -415,7 +415,7 @@ def _node_audit(s):
 
 def _build_graph():
     g=StateGraph(TierState)
-    # v8 nodes: skill_selector + claude_brain added
+    # v9 nodes (8): classify->skill_selector->claude_brain->prewarm_check->[t2_analysis|t1_execute]->escalate->audit
     g.add_node("classify",       _node_classify)
     g.add_node("skill_selector", _node_skill_selector)
     g.add_node("claude_brain",   _node_claude_brain)
@@ -511,21 +511,24 @@ def activate_tier_routing(session_id:str="auto") -> dict:
         return "NOT PULLED - ollama pull "+name
     return {"activated":True,"session_id":session_id,"timestamp":time.strftime("%Y-%m-%d %H:%M:%S"),
             "mode":"LANGGRAPH_HARD" if graph else "MCP_SOFT_CHAIN","langgraph":LANGGRAPH_AVAILABLE,
-            "v8_nodes":["classify","skill_selector","claude_brain","prewarm_check","t1_execute","escalate","audit"],
+            "v9_nodes":["classify","skill_selector","claude_brain","prewarm_check","t2_analysis","t1_execute","escalate","audit"],
             "live_models":{"T1-LOCAL":MODEL_T1_LOCAL+" - "+ms(MODEL_T1_LOCAL),
                            "T1-MID":MODEL_T1_MID+" - "+ms(MODEL_T1_MID),
                            "T1-CLOUD":MODEL_T1_CLOUD+" - "+ms(MODEL_T1_CLOUD)},
             "models_in_ram":loaded,"models_pulled":pulled,"ollama_available":live["available"],
             "interception":"Bash/Edit/Write -> intercept.py -> Ollama T1",
-            "banner":("DSR AI-Lab TIER ROUTING v8 ACTIVE\n"
+            "banner":("DSR AI-Lab TIER ROUTING v9 ACTIVE\n"
                       "  Claude: BRAIN+SKILLS - never executes\n"
                       "  T1-LOCAL  "+MODEL_T1_LOCAL+"  "+ms(MODEL_T1_LOCAL)+"\n"
                       "  T1-MID    "+MODEL_T1_MID+"  "+ms(MODEL_T1_MID)+"\n"
-                      "  T1-CLOUD  "+MODEL_T1_CLOUD+"  "+ms(MODEL_T1_CLOUD)+"\n"
+                      "  T1-CLOUD  "+MODEL_T1_CLOUD+"  "+ms(MODEL_T1_CLOUD)+" (EPIC)\n"
                       "  T2-FLASH  gemini-2.5-flash  analysis only\n"
                       "  T2-KIMI   Kimi-K2-Instruct  analysis only\n"
-                      "  v8: Bash/Edit/Write -> intercept.py -> Ollama\n"
-                      "  v8: skill_selector + claude_brain in LangGraph")}
+                      "  T3-EPIC   REMOVED - epic tasks -> T1-CLOUD directly\n"
+                      "  v9: LangGraph 8 nodes - classify->skill_selector->claude_brain\n"
+                      "      ->prewarm_check->[t2_analysis|t1_execute]->escalate->audit\n"
+                      "  v9: Bash/Edit/Write -> intercept.py -> Ollama\n"
+                      "  v9: skill_selector + claude_brain in LangGraph")}
 
 
 @mcp.tool()
@@ -568,7 +571,7 @@ def tier_health_check(tier:str="ALL") -> dict:
     live=_get_live_model_status()
     return {"tiers":checks,"models_in_ram":live.get("loaded",[]),
             "routing_mode":"LANGGRAPH_HARD" if LANGGRAPH_AVAILABLE else "MCP_SOFT_CHAIN",
-            "v8_graph":"classify->skill_selector->claude_brain->prewarm->execute->escalate->audit",
+            "v9_graph":"classify->skill_selector->claude_brain->prewarm_check->[t2_analysis|t1_execute]->escalate->audit",
             "interception":"Bash/Edit/Write->intercept.py->Ollama T1"}
 
 
@@ -591,8 +594,8 @@ def check_tier_enforcer() -> dict:
     """Heartbeat. If this responds tier-enforcer is alive."""
     return {"alive":True,"timestamp":time.strftime("%Y-%m-%d %H:%M:%S"),
             "mode":"LANGGRAPH_HARD" if _get_graph() else "MCP_SOFT_CHAIN",
-            "claude_blocked":True,"v8_interception":True,
-            "message":"Tier enforcer v8 alive - Bash/Edit/Write intercepted to Ollama"}
+            "claude_blocked":True,"v9_interception":True,
+            "message":"Tier enforcer v9 alive - Bash/Edit/Write intercepted to Ollama"}
 
 
 @mcp.tool()
