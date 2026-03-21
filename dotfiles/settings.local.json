@@ -1,0 +1,45 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '' && echo '╔══════════════════════════════════════════════════════════════════════╗' && echo '║  DSR AI-LAB — TIER ROUTING v6 — ACTIVE (NON-NEGOTIABLE)             ║' && echo '╠══════════════════════════════════════════════════════════════════════╣' && echo '║  Brain  : Claude (plan only — NEVER self-executes)                  ║' && echo '║  MCP    : tier-enforcer-mcp  tier-router-mcp  (AUTO-START)          ║' && echo '║  Skill  : /tier-routing  /tier-health  /tier-audit  /tier-reset     ║' && echo '║  Trace  : LangSmith ✓  Project: dsr-ai-lab-tier-routing             ║' && echo '║  Prompt : ~/.claude/CLAUDE.md (v6) + tier-routing.md (injected)     ║' && echo '╠══════════════════════════════════════════════════════════════════════╣' && echo '║  T1-LOCAL : qwen2.5-coder:7b       → SIMPLE          (Ollama local) ║' && echo '║  T1-MID   : qwen3-coder:30b        → MODERATE-SMALL  (Ollama cloud) ║' && echo '║  T1-CLOUD : qwen3-coder:480b-cloud → MODERATE-LARGE  (Ollama cloud) ║' && echo '║  T2-FLASH : gemini-2.5-flash       → COMPLEX-FAST    (Gemini CLI)   ║' && echo '║  T2-PRO   : gemini-2.5-pro         → COMPLEX-DEEP    (Gemini CLI)   ║' && echo '║  T2-KIMI  : Kimi-K2-Instruct       → COMPLEX-REASON  (HF API)       ║' && echo '║  T3       : claude-sonnet-4-6      → EPIC ONLY        (Subscription)║' && echo '╠══════════════════════════════════════════════════════════════════════╣' && echo '║  CHAIN : T1-LOCAL→T1-MID→T1-CLOUD→T2-FLASH→T2-PRO→T2-KIMI→T3      ║' && echo '║  GATE  : T3 BLOCKED unless EPIC or full chain exhausted              ║' && echo '║  EXEC  : Ollama T1 executes | T2 analysis only | T3 blueprint only  ║' && echo '╠══════════════════════════════════════════════════════════════════════╣' && T1=$(curl -s --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1 && echo '✓ LIVE' || echo '✗ DOWN') && T2=$(GOOGLE_GENAI_USE_GCA=true gemini --version >/dev/null 2>&1 && echo '✓ LIVE' || echo '✗ DOWN') && printf '║  PRE-FLIGHT: T1-Ollama %-6s  T2-Gemini %-6s  T3-Claude ✓ AUTH  ║\\n' \"$T1\" \"$T2\" && echo '╚══════════════════════════════════════════════════════════════════════╝' && echo ''",
+            "statusMessage": "DSR AI-Lab Tier Routing v6 — Pre-flight health check running..."
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(brew:*)",
+      "Bash(node --version:*)",
+      "Bash(claude:*)",
+      "Bash(for tool in jq yq curl wget git gh ripgrep fd fzf bat)",
+      "Bash(do which $tool)",
+      "Bash(echo:*)",
+      "Bash(done)",
+      "Bash(chmod:*)",
+      "Bash(bash:*)",
+      "Bash(source:*)",
+      "Bash(ollama:*)",
+      "Bash(ollama list:*)",
+      "Bash(curl:*)",
+      "Bash(ls:*)",
+      "Bash(test:*)",
+      "Bash(for t in jq yq curl wget git gh rg fd fzf bat)",
+      "Bash(do which $t)",
+      "Bash(printf:*)",
+      "Bash(printf \" ✗ $t\\n\")",
+      "Bash(open:*)",
+      "Bash(osascript:*)",
+      "Bash(npx:*)",
+      "Bash(npm search:*)",
+      "WebSearch",
+      "Bash(uvx mcp-server-git --help)",
+      "Bash(gemini:*)"
+    ]
+  }
+}
