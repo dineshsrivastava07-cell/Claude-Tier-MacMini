@@ -1,152 +1,197 @@
-# Claude-Tier-MacMini — DSR AI-Lab Tier Routing v9
+# Claude-Tier-MacMini — DSR AI-Lab Tier Routing v9.1
 
-**Production-grade dual-MCP AI orchestration system for Claude CLI on Mac Mini.**
+**Production-grade AI orchestration for Claude CLI on Mac Mini.**
 
-Routes every task to the optimal AI model automatically via LangGraph state machine. Claude acts as **Brain only** — Ollama T1 models execute all code, files, and bash commands.
+Every task is automatically routed to the optimal model via a LangGraph state machine.
+**Claude = Brain only.** Ollama T1 models execute all code, files, and bash commands.
+T2 models (Gemini / HuggingFace Kimi) provide analysis only — they never execute.
 
 ---
 
-## What's New in v9
+## What's New in v9.1
 
 | Change | Detail |
 |--------|--------|
-| T3-EPIC removed | Was redundant — `claude_brain` node already plans every task |
-| Epic tasks | Now route directly to **T1-CLOUD** (qwen3-coder:480b-cloud) |
-| LangGraph nodes | Reduced from 9 → 8 (removed `t3_plan`) |
-| MODEL_T1_CLOUD | Fixed to `qwen3-coder:480b-cloud` (was `qwen3-coder:480b`) |
-| keep_alive=-1 | Added to all 3 Ollama tiers — models stay in RAM |
-| DB schema | `routing_log` expanded to 11 columns (`elapsed`, `skills`, `brain_used`) |
-| Pydantic warning | Suppressed at startup (Python 3.14 + langchain_core shim) |
-| Prewarm guard | Checks `/api/ps` before loading — prevents duplicate model processes |
-| Watchdog | Single instance enforced — kills duplicates automatically |
-| Auth | OAuth via macOS Keychain (sk-ant-oat01-...) — API key removed from env |
+| `startup_banner.py` | Replaces static echo hook — full live status banner on every `claude` start |
+| Live per-model status | Each model shows `✅ LIVE (in RAM)` / `⚡ READY (on-demand)` / `✗ NOT PULLED` |
+| LangSmith live check | API ping on startup — shows server version + SDK version + project name |
+| LangGraph live check | Import + version check (`v1.1.3` confirmed) |
+| TierEnforcer status | intercept.py ✅ + DB row count + server.py existence |
+| 22 MCP servers verified | All server scripts checked on startup — any missing shown `✗` |
+| 12 Skills verified | All skill `.md` files checked — missing files flagged |
+| HF API fix | Uses `/api/whoami-v2` (deprecated `/api/whoami` always returns 401) |
+| HF Pro account | Shows `✅ LIVE @DSR07 (Pro)` with plan + username |
+| Settings env reading | `startup_banner.py` reads `HF_API_KEY` directly from `settings.json` |
+| Auto-prewarm background | T1-LOCAL + T1-MID loaded to RAM in background thread on every start |
+| Prewarm smart guard | Only prewarms models not already in RAM — skips if warm |
+
+---
+
+## Live Startup Banner (every `claude` session)
+
+```
+╔════════════════════════════════════════════════════════════════════════════╗
+║             DSR AI-LAB — TIER ROUTING v9  |  FULL LIVE STATUS              ║
+╠════════════════════════════════════════════════════════════════════════════╣
+║  🧠 Claude      ✅ AUTH  OAuth via macOS Keychain                            ║
+║    Bash        NATIVE  (not intercepted)                                   ║
+║    Edit/Write  intercept.py → Ollama T1  (auto-routed)                     ║
+╠════════════════════════════════════════════════════════════════════════════╣
+║                               INFRASTRUCTURE                               ║
+║  LangGraph   ✅ LIVE  v1.1.3  8-node pipeline active                        ║
+║  LangSmith   ✅ LIVE  server=0.13.32  sdk=0.7.13  project=dsr-ai-lab-tier-v9║
+║  TierEnforcer intercept ✅  DB ✅ (N routes logged)  server ✅               ║
+╠════════════════════════════════════════════════════════════════════════════╣
+║                  EXECUTORS — Ollama  (all code execution)                  ║
+║  ⚙ T1-LOCAL  qwen2.5-coder:7b        ✅ LIVE (in RAM)                       ║
+║  ⚙ T1-MID    qwen2.5-coder:14b       ✅ LIVE (in RAM)                       ║
+║  ⚙ T1-CLOUD  qwen3-coder:480b-cloud  ⚡ READY (on-demand)                   ║
+╠════════════════════════════════════════════════════════════════════════════╣
+║                ANALYSIS — Gemini / HF  (never execute code)                ║
+║  🔍 T2-FLASH  gemini-2.5-flash   ✅ LIVE  v0.33.0                            ║
+║  🔍 T2-PRO    gemini-2.5-pro     ✅ LIVE  v0.33.0                            ║
+║  🔍 T2-KIMI   Kimi-K2-Instruct   ✅ LIVE  @DSR07 (Pro)                       ║
+╠════════════════════════════════════════════════════════════════════════════╣
+║              MCP SERVERS (22)  —  ✅ 22 active  ✅ all present               ║
+║  ✅tier-enforcer  ✅filesystem  ✅git  ✅memory  ✅github  ✅gdrive  ...        ║
+╠════════════════════════════════════════════════════════════════════════════╣
+║                        SKILLS (12)  —  ✅ all loaded                        ║
+║  ✅aiapp  ✅arch  ✅math  ✅multifile  ✅rca  ✅scope  ✅tier-*  ✅wire          ║
+╠════════════════════════════════════════════════════════════════════════════╣
+║  🔥 Prewarm   ⏳ Loading 7b+14b → RAM (background)                          ║
+║  📦 Pulled    9 Ollama models in library                                    ║
+║  🔗 Pipeline  classify→skill→brain→prewarm→execute→escalate→audit           ║
+╚════════════════════════════════════════════════════════════════════════════╝
+```
 
 ---
 
 ## System Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     DSR AI-Lab Mac Mini                         │
-│                                                                 │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │  Claude CLI (Brain — Bash/Edit/Write DISABLED)           │  │
-│  │                                                          │  │
-│  │  tier-enforcer-mcp  ←──── PreToolUse Hook               │  │
-│  │  (Python/FastMCP)         Edit/Write/MultiEdit           │  │
-│  │  LangGraph 8 nodes        → intercept.py → Ollama        │  │
-│  │                                                          │  │
-│  │  tier-router-mcp ──────────────────────────────────────► │  │
-│  │  (TypeScript/Node)   18 MCP Tools + Pipelines            │  │
-│  └──────────────────────────────────────────────────────────┘  │
-│                              │                                  │
-│              ┌───────────────┼───────────────┐                  │
-│              ▼               ▼               ▼                  │
-│     ┌──────────────┐ ┌─────────────┐ ┌──────────────┐         │
-│     │   T1-LOCAL   │ │   T1-MID    │ │  T1-CLOUD    │         │
-│     │qwen2.5:7b    │ │qwen2.5:14b  │ │qwen3:480b    │         │
-│     │ Ollama local │ │ Ollama local│ │ Ollama cloud │         │
-│     │  EXECUTES    │ │  EXECUTES   │ │  EXECUTES    │         │
-│     └──────────────┘ └─────────────┘ └──────────────┘         │
-│                                                                 │
-│     ┌──────────────┐ ┌─────────────┐ ┌──────────────┐         │
-│     │   T2-FLASH   │ │   T2-PRO    │ │   T2-KIMI    │         │
-│     │gemini-2.5-   │ │gemini-2.5-  │ │Kimi-K2-      │         │
-│     │flash         │ │pro          │ │Instruct      │         │
-│     │ ANALYSIS     │ │ ANALYSIS    │ │ ANALYSIS     │         │
-│     │ only         │ │ only        │ │ only         │         │
-│     └──────────────┘ └─────────────┘ └──────────────┘         │
-└─────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│                       DSR AI-Lab  Mac Mini                         │
+│                                                                    │
+│  ┌────────────────────────────────────────────────────────────┐   │
+│  │  Claude CLI  —  BRAIN ONLY                                 │   │
+│  │  Bash = NATIVE  |  Edit/Write/MultiEdit = BLOCKED          │   │
+│  │                                                            │   │
+│  │  SessionStart Hook ──► startup_banner.py                   │   │
+│  │    Live checks: Ollama + Gemini + HF + LangSmith +         │   │
+│  │    LangGraph + TierEnforcer + 22 MCPs + 12 Skills          │   │
+│  │    Auto-prewarms T1-LOCAL + T1-MID (background)            │   │
+│  │                                                            │   │
+│  │  PreToolUse Hook ──► intercept.py ──► Ollama T1            │   │
+│  │    Intercepts: Edit | Write | MultiEdit | NotebookEdit     │   │
+│  │    Passthrough: Bash (native)                              │   │
+│  │                                                            │   │
+│  │  tier-enforcer-mcp  (Python / FastMCP 3.1.0)               │   │
+│  │  LangGraph 8 nodes: classify → skill_selector →            │   │
+│  │  claude_brain → prewarm_check → [t2_analysis|t1_execute]   │   │
+│  │  → escalate → audit                                        │   │
+│  └────────────────────────────────────────────────────────────┘   │
+│                              │                                     │
+│          ┌───────────────────┼───────────────────┐                │
+│          ▼                   ▼                   ▼                │
+│  ┌──────────────┐  ┌───────────────┐  ┌─────────────────┐        │
+│  │  T1-LOCAL    │  │   T1-MID      │  │   T1-CLOUD      │        │
+│  │ qwen2.5:7b   │  │ qwen2.5:14b   │  │ qwen3:480b-cloud│        │
+│  │ Ollama local │  │ Ollama local  │  │  Ollama cloud   │        │
+│  │   4.7 GB     │  │   9.0 GB      │  │  (remote GPU)   │        │
+│  │  EXECUTES    │  │  EXECUTES     │  │    EXECUTES     │        │
+│  └──────────────┘  └───────────────┘  └─────────────────┘        │
+│                                                                    │
+│  ┌──────────────┐  ┌───────────────┐  ┌─────────────────┐        │
+│  │   T2-FLASH   │  │   T2-PRO      │  │    T2-KIMI      │        │
+│  │gemini-2.5-   │  │ gemini-2.5-pro│  │ Kimi-K2-Instruct│        │
+│  │flash         │  │               │  │  HF Inference   │        │
+│  │ ANALYSIS ──► T1-MID executes ◄───────── ANALYSIS     │        │
+│  └──────────────┘  └───────────────┘  └─────────────────┘        │
+└────────────────────────────────────────────────────────────────────┘
 ```
-
-**Key principle:** T2 tiers **analyze only** — their output enriches the T1 prompt. T1 always executes.
 
 ---
 
 ## Tier Reference
 
-| Tier | Model | Role | Execution | RAM |
-|------|-------|------|-----------|-----|
-| T1-LOCAL | qwen2.5-coder:7b | executor | Ollama localhost:11434 | 4.7 GB |
-| T1-MID | qwen2.5-coder:14b | executor | Ollama localhost:11434 | 9.0 GB |
-| T1-CLOUD | qwen3-coder:480b-cloud | executor (epic) | Ollama cloud | cloud |
-| T2-FLASH | gemini-2.5-flash | analysis → T1-MID | Gemini CLI | — |
-| T2-PRO | gemini-2.5-pro | analysis → T1-MID | Gemini CLI | — |
-| T2-KIMI | Qwen/Kimi-K2-Instruct | analysis → T1-MID | HF Inference API | — |
-
----
-
-## Dual MCP Components
-
-### 1. tier-enforcer-mcp (`tier-enforcer/server.py`)
-- **Framework:** FastMCP 3.1.0 (Python)
-- **Scope:** Claude CLI global (`~/.claude/settings.json`)
-- **Role:** LangGraph orchestrator — classify, brain, route, audit
-- **Hook:** `PreToolUse → Edit|Write|MultiEdit|NotebookEdit → intercept.py → Ollama`
-- **DB:** `~/.tier-enforcer/memory.db` SQLite — 11-column `routing_log`
-
-### 2. tier-router-mcp (`src/`)
-- **Framework:** TypeScript, ESM, Node 20+
-- **Scope:** User-level auto-start
-- **Role:** 18 MCP tools — direct T1/T2/T3 calls + pipeline chains
-- **Resources:** `tier://config`, `tier://metrics`, `tier://routing-log`
+| Tier | Model | Role | Host | RAM |
+|------|-------|------|------|-----|
+| T1-LOCAL | qwen2.5-coder:7b | executor — simple/fast | Ollama localhost:11434 | 4.7 GB |
+| T1-MID | qwen2.5-coder:14b | executor — complex code | Ollama localhost:11434 | 9.0 GB |
+| T1-CLOUD | qwen3-coder:480b-cloud | executor — epic/greenfield | Ollama cloud | cloud |
+| T2-FLASH | gemini-2.5-flash | analysis → T1-MID executes | Gemini CLI v0.33.0 | — |
+| T2-PRO | gemini-2.5-pro | deep review → T1-MID executes | Gemini CLI v0.33.0 | — |
+| T2-KIMI | Qwen/Kimi-K2-Instruct | math/algo → T1-MID executes | HF Inference API (Pro) | — |
 
 ---
 
 ## LangGraph Pipeline (8 Nodes)
 
 ```
-classify → skill_selector → claude_brain → prewarm_check
-                                                 │
-                           ┌─────────────────────┤
-                           ▼                     ▼
-                    t2_analysis           t1_execute
-                  (Gemini/Kimi)          (Ollama T1)
-                           └─────────────────────┘
-                                         │
-                                    escalate → audit → END
-```
-
-| Node | Role |
-|------|------|
-| `classify` | Keyword-based tier classification |
-| `skill_selector` | Loads domain skill context |
-| `claude_brain` | Claude plans the execution approach — runs for EVERY tier |
-| `prewarm_check` | Verifies T1 models are in Ollama RAM |
-| `t2_analysis` | Gemini/Kimi analysis (enriches T1 prompt) |
-| `t1_execute` | Ollama runs the task (bash/files/code) |
-| `escalate` | Fallback to next tier if score below threshold |
-| `audit` | Writes result to SQLite routing_log (11 cols) |
-
----
-
-## Classifier Rules
-
-| Task Signal | → Tier | Examples |
-|------------|--------|---------|
-| debug / error / failing / broken / traceback | T2-FLASH | "debug this error", "test failing" |
-| analyze / explain / review | T2-PRO | "explain this architecture" |
-| reason / complex logic | T2-KIMI | "reason through this algorithm" |
-| greenfield / epic / full platform | T1-CLOUD | "build complete ecommerce platform" |
-| moderate / write module | T1-MID | "write this module" |
-| simple / rename / utility | T1-LOCAL | "rename this function" |
-
----
-
-## Task Routing Flow
-
-```
-User sends task
-       │
+Input Task
+    │
+    ▼
+┌─────────────┐
+│  classify   │  Keyword scan → tier assignment
+└──────┬──────┘
        ▼
-[Claude Brain — classify]
+┌──────────────────┐
+│  skill_selector  │  Load domain skill file into context
+└──────┬───────────┘
+       ▼
+┌──────────────┐
+│ claude_brain │  Claude writes execution plan (runs for EVERY tier)
+└──────┬───────┘
+       ▼
+┌───────────────┐
+│ prewarm_check │  Verify T1 models are loaded in Ollama RAM
+└──────┬────────┘
        │
-       ├──► T1-LOCAL  → Ollama qwen2.5-coder:7b  → executes
-       ├──► T1-MID    → Ollama qwen2.5-coder:14b → executes
-       ├──► T1-CLOUD  → Ollama qwen3-coder:480b-cloud → executes
-       ├──► T2-FLASH  → gemini-2.5-flash analyzes → T1-MID executes
-       ├──► T2-PRO    → gemini-2.5-pro analyzes   → T1-MID executes
-       └──► T2-KIMI   → Kimi-K2 analyzes          → T1-MID executes
+   ┌───┴────────────────────────┐
+   │                            │
+   ▼ (if T2 classified)         ▼ (T1 classified)
+┌────────────┐          ┌──────────────┐
+│ t2_analysis│          │  t1_execute  │
+│ Gemini/Kimi│──────►   │  Ollama T1   │
+└────────────┘          └──────┬───────┘
+                               ▼
+                        ┌─────────────┐
+                        │  escalate   │  score < threshold → next tier (max 2x)
+                        └──────┬──────┘
+                               ▼
+                        ┌─────────────┐
+                        │    audit    │  Write to routing_log (11 cols)
+                        └──────┬──────┘
+                               ▼
+                              END
+```
+
+---
+
+## Task Classification → Routing
+
+```
+Incoming Task Text
+        │
+        ▼ keyword scan (priority order)
+        │
+        ├─ "debug" / "error" / "failing" / "broken" / "traceback"
+        │         └──► T2-FLASH  (gemini-flash analyzes → T1-MID executes)
+        │
+        ├─ "analyze" / "explain" / "review" / "audit entire"
+        │         └──► T2-PRO    (gemini-pro reviews   → T1-MID executes)
+        │
+        ├─ "algorithm" / "math" / "big-o" / "statistical"
+        │         └──► T2-KIMI   (Kimi-K2 reasons      → T1-MID executes)
+        │
+        ├─ "full platform" / "greenfield" / "complete system" / "end to end"
+        │         └──► T1-CLOUD  (qwen3-coder:480b-cloud executes directly)
+        │
+        ├─ "implement" / "write module" / "refactor" / "integrate"
+        │         └──► T1-MID    (qwen2.5-coder:14b executes)
+        │
+        └─ everything else (default)
+                  └──► T1-LOCAL  (qwen2.5-coder:7b executes)
 ```
 
 ---
@@ -154,118 +199,141 @@ User sends task
 ## Intercept Flow (Edit/Write Protection)
 
 ```
-Claude attempts: Edit | Write | MultiEdit | NotebookEdit
-                              │
-                              ▼
-                     intercept.py (PreToolUse hook)
-                              │
-                    ┌─────────┴──────────┐
-                    │                    │
-              Bash tool             Edit/Write/etc.
-                    │                    │
-              PASSTHROUGH         Route to Ollama T1
-              (native exec)       → file written by model
-```
-
-Bash runs natively. File ops always go through Ollama — Claude cannot write files directly.
-
----
-
-## Session Startup Sequence
-
-```
-1. Terminal opens
-   → zshrc: guarded prewarm (checks /api/ps → loads 7b+14b only if cold)
-   → zshrc: watchdog starts (single instance guard)
-
-2. User types: claude
-   → macOS Keychain → OAuth token (sk-ant-oat01-...) → claude.ai subscription
-   → settings.json → 22 MCP servers + hooks
-   → CLAUDE.md → brain protocol v8
-
-3. Mandatory startup calls:
-   → activate_tier_routing()   LangGraph 8 nodes compiled
-   → tier_health_check()       all tiers verified
-   → prewarm_models()          7b + 14b confirmed IN RAM
-
-4. STARTUP BANNER shown with live model status
+Claude Brain produces plan
+         │
+         ▼
+  Claude attempts tool call
+         │
+         ├──[Bash]──────────────────────────► NATIVE EXEC (passthrough)
+         │
+         └──[Edit | Write | MultiEdit | NotebookEdit]
+                    │
+                    ▼
+             intercept.py  (PreToolUse hook)
+                    │
+                    ▼
+         Route to Ollama T1 model
+         POST /api/chat  (keep_alive=-1)
+                    │
+                    ▼
+         Ollama generates + writes file/edit
+                    │
+                    ▼
+         Claude is blocked — did NOT write
 ```
 
 ---
 
-## tier-router-mcp Tools (18)
+## Startup Sequence
 
-### Routing Tools
-| Tool | Description |
-|------|-------------|
-| `tier_route_task` | Auto-route with quality-gate fallback |
-| `tier_health_check` | Probe all tier availability |
-| `tier_explain_decision` | Classify prompt — dry run |
-| `tier_override` | Force a specific tier |
+```
+Terminal opens
+      │
+      ▼ (zshrc / Login Item)
+claude-ollama-prewarm.sh
+  ├─ GET /api/ps → models loaded?
+  ├─ If cold: POST /api/chat 7b + 14b  keep_alive=-1  (background)
+  └─ Log to ~/.tier-enforcer/prewarm.log
 
-### T1 Tools (Ollama)
-| Tool | Model |
-|------|-------|
-| `t1_local_generate` | qwen2.5-coder:7b |
-| `t1_local_complete` | qwen2.5-coder:7b — fill-in-the-middle |
-| `t1_cloud_generate` | qwen3-coder:480b-cloud |
-| `t1_cloud_analyze` | qwen3-coder:480b-cloud — audit |
+      │
+      ▼  user types: claude
+Claude CLI authenticates
+  ├─ macOS Keychain: "Claude Code-credentials" → OAuth sk-ant-oat01-...
+  └─ claude.ai subscription verified
 
-### T2 Tools (Gemini)
-| Tool | Model |
-|------|-------|
-| `t2_gemini_pro_reason` | gemini-2.5-pro |
-| `t2_gemini_flash_generate` | gemini-2.5-flash |
-| `t2_gemini_lite_validate` | gemini-2.5-flash-lite |
-| `t2_gemini_analyze_image` | gemini-2.5-pro — image |
+      │
+      ▼  settings.json loaded
+  ├─ 22 MCP servers spawned via stdio
+  ├─ PreToolUse hook: intercept.py registered
+  └─ CLAUDE.md brain protocol loaded
 
-### T3 Tools (Claude — reference only)
-| Tool | Purpose |
-|------|---------|
-| `t3_claude_architect` | Architecture decision reference |
-| `t3_claude_epic` | Epic task analysis reference |
+      │
+      ▼  SessionStart hook fires → startup_banner.py
+  Parallel threads (max 6s):
+  ├─ Claude OAuth     → macOS Keychain check
+  ├─ LangGraph        → import check + version
+  ├─ LangSmith        → GET api.smith.langchain.com/info
+  ├─ TierEnforcer     → intercept.py + DB + server.py
+  ├─ Ollama           → GET /api/tags + /api/ps per-model
+  ├─ Gemini CLI       → gemini --version
+  ├─ HF API           → GET /api/whoami-v2 (not whoami — that's broken)
+  ├─ 22 MCP servers   → each script/command existence
+  ├─ 12 Skills        → each .md file existence
+  └─ Auto-prewarm bg  → 7b + 14b if not in RAM
 
-### Pipeline Tools
-| Tool | Chain |
-|------|-------|
-| `pipeline_code_review` | T1 lint → T2 semantic → T3 architecture |
-| `pipeline_debug_chain` | T1 hypothesis → T2 analysis → T3 root-cause |
-| `pipeline_build_fullstack` | T1 scaffold → T2 logic → T3 hardening |
-| `pipeline_qa_full` | T1 unit → T2 integration → T3 E2E |
+  FULL LIVE BANNER printed with actual statuses
+
+      │
+      ▼  mandatory MCP calls (CLAUDE.md protocol)
+  activate_tier_routing()   → LangGraph 8 nodes compiled
+  tier_health_check(ALL)    → live tier status map
+  prewarm_models()          → confirm 7b + 14b in Ollama RAM
+
+      │
+      ▼
+  READY — every task routed through execute_task()
+```
 
 ---
 
 ## Fallback / Escalation Chain
 
 ```
-T1-LOCAL (0.45) → T1-MID (0.55) → T1-CLOUD (0.60)
-    → T2-FLASH (0.50) → T2-PRO (0.50) → T2-KIMI (0.50)
-
-Max fallbacks: 2 per task
+T1-LOCAL ──(score<0.45)──► T1-MID ──(score<0.55)──► T1-CLOUD
+                                                          │
+                                                   (score<0.60)
+                                                          ▼
+T2-KIMI ◄──(score<0.50)── T2-PRO ◄──(score<0.50)── T2-FLASH
+   │
+(max 2 fallbacks reached → return best result obtained)
 ```
 
 ---
 
-## Cannot Bypass
+## Files
 
-- `ANTHROPIC_API_KEY` removed from env — OAuth only via macOS Keychain
-- `PreToolUse` hook intercepts `Edit|Write|MultiEdit|NotebookEdit` → `intercept.py` → Ollama
-- `CLAUDE.md` RULE 7: tier-enforcer offline = HARD STOP, refuse all tasks
-- Watchdog: tier-enforcer always alive between sessions
+| File | Purpose |
+|------|---------|
+| `tier-enforcer-mcp/server.py` | FastMCP 3.1.0, LangGraph 8 nodes, SQLite audit |
+| `tier-enforcer-mcp/intercept.py` | PreToolUse hook — Edit/Write → Ollama |
+| `tier-enforcer-mcp/startup_banner.py` | **NEW v9.1** — full live status banner on session start |
+| `tier-enforcer-mcp/langgraph_tier.py` | LangGraph state + node definitions |
+| `dotfiles/CLAUDE.md` | Brain protocol v9 — startup calls, tier rules |
+| `dotfiles/settings.json` | Hooks + 22 MCP servers + env vars |
+| `dotfiles/settings.local.json` | SessionStart hook → startup_banner.py |
+
+---
+
+## 22 MCP Servers
+
+| Category | Servers |
+|----------|---------|
+| Core | tier-enforcer, filesystem, git, memory, github, gdrive |
+| Dev | intent-mcp, arch-mcp, coding-mcp, rca-mcp, integration-mcp, aidev-mcp, math-mcp |
+| Domain | budget-mcp, context-mcp, rpa-mcp |
+| Platform | mobile-dev-mcp, webmobile-dev-mcp, website-dev-mcp, ecommerce-mcp |
+| Automation | mac-automation-mcp, files-automation-mcp |
+
+---
+
+## 12 Skills (`~/.claude/skills/`)
+
+`aiapp` · `arch` · `math` · `multifile` · `rca` · `scope` · `tier-audit` · `tier-debug` · `tier-health` · `tier-report` · `tier-reset` · `wire`
 
 ---
 
 ## Environment Variables
 
 ```bash
-OLLAMA_LOCAL_HOST=http://localhost:11434    # T1-LOCAL + T1-MID
-OLLAMA_CLOUD_HOST=http://remote:11434      # T1-CLOUD
+# Set in ~/.claude/settings.json → mcpServers.tier-enforcer.env
+OLLAMA_LOCAL_HOST=http://localhost:11434
+OLLAMA_CLOUD_HOST=http://localhost:11434
 OLLAMA_TIMEOUT_LOCAL=600
 OLLAMA_TIMEOUT_MID=600
 OLLAMA_TIMEOUT_CLOUD=600
-HF_API_KEY=...                             # HuggingFace (T2-KIMI)
-GEMINI_API_KEY=...                         # Optional (account auth used if unset)
-QUALITY_THRESHOLD=0.75
+HF_API_KEY=hf_...                  # HuggingFace read token (whoami-v2 verified)
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_PROJECT=dsr-ai-lab-tier-v9
 ```
 
 ---
@@ -276,24 +344,51 @@ QUALITY_THRESHOLD=0.75
 git clone https://github.com/dineshsrivastava07-cell/Claude-Tier-MacMini.git
 cd Claude-Tier-MacMini
 
-# tier-router-mcp (TypeScript)
+# Python dependencies
+pip install fastmcp langgraph langchain-core huggingface_hub langsmith
+
+# TypeScript tier-router-mcp
 npm install && npm run build
 
-# tier-enforcer-mcp (Python)
-pip install fastmcp langgraph langchain-core huggingface_hub
+# Copy dotfiles
+cp dotfiles/CLAUDE.md ~/.claude/CLAUDE.md
+cp dotfiles/settings.json ~/.claude/settings.json
+cp dotfiles/settings.local.json ~/.claude/settings.local.json
 
-# Register with Claude CLI
-claude mcp add tier-enforcer python ~/tier-enforcer-mcp/server.py
-claude mcp add tier-router node ~/tier-router-mcp/dist/index.js \
-  -e OLLAMA_LOCAL_HOST=http://localhost:11434
+# Copy tier-enforcer-mcp
+mkdir -p ~/tier-enforcer-mcp
+cp tier-enforcer-mcp/*.py ~/tier-enforcer-mcp/
+cp tier-enforcer-mcp/*.sh ~/tier-enforcer-mcp/
 
-# Auth
-claude auth login   # OAuth token → macOS Keychain
+# Set API keys in ~/.claude/settings.json
+#   HF_API_KEY        = HuggingFace token with read scope
+#   LANGCHAIN_API_KEY = LangSmith token (in env, not in settings.json)
 
-# Start watchdog
-~/tier-enforcer-mcp/watchdog.sh &
+# Authenticate Claude
+claude auth login   # OAuth → macOS Keychain
+
+# Start
+claude
+# startup_banner.py fires automatically — full live status shown
 ```
 
 ---
 
-*DSR AI-Lab — Mac Mini — v9 — 2026-03-22*
+## v9 → v9.1 Changes
+
+| Aspect | v9 | v9.1 |
+|--------|----|------|
+| Startup banner | Static echo one-liner | `startup_banner.py` — real parallel live checks |
+| Model status | Binary Ollama ✓/✗ | Per-model: `✅ LIVE` / `⚡ READY` / `✗ NOT PULLED` |
+| LangSmith | Not shown | Live API ping — server + SDK version |
+| LangGraph | Not shown | Import + version |
+| TierEnforcer | Not shown | intercept.py + DB rows + server.py |
+| MCP status | Not shown | All 22 verified on startup |
+| Skills status | Not shown | All 12 verified on startup |
+| HF endpoint | `/api/whoami` (401) | `/api/whoami-v2` (correct) |
+| HF key source | env only | Reads `settings.json` directly |
+| Prewarm | External script only | Background thread in `startup_banner.py` |
+
+---
+
+*DSR AI-Lab — Mac Mini — v9.1 — 2026-03-22*

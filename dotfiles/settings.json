@@ -1,0 +1,67 @@
+{
+  "_readme": "DSR AI-Lab v9 Final. Bash=native. Edit/Write=intercepted->Ollama. Claude=brain only.",
+  "_auth": "OAuth via macOS Keychain. ANTHROPIC_API_KEY must NOT be set in environment.",
+  "_mcp_lifecycle": "Claude CLI spawns server.py via stdio on session start. No external watchdog needed.",
+
+  "hooks": {
+    "PreToolUse": [
+      {
+        "_comment": "Intercept Edit/Write/MultiEdit -> route to Ollama T1. Bash excluded (native).",
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type":    "command",
+            "command": "python3 /Users/dsr-ai-lab/tier-enforcer-mcp/intercept.py"
+          }
+        ]
+      }
+    ]
+  },
+
+  "mcpServers": {
+    "tier-enforcer": {
+      "_comment": "Claude CLI spawns this via stdio on session start. No watchdog needed.",
+      "command": "python3",
+      "args": ["/Users/dsr-ai-lab/tier-enforcer-mcp/server.py"],
+      "env": {
+        "OLLAMA_LOCAL_HOST":    "http://localhost:11434",
+        "OLLAMA_CLOUD_HOST":    "http://localhost:11434",
+        "OLLAMA_TIMEOUT_LOCAL": "600",
+        "OLLAMA_TIMEOUT_MID":   "600",
+        "OLLAMA_TIMEOUT_CLOUD": "600",
+        "HF_API_KEY":           "YOUR_HF_API_KEY_HERE",
+        "LANGCHAIN_TRACING_V2": "true",
+        "LANGCHAIN_PROJECT":    "dsr-ai-lab-tier-v9"
+      }
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y","@modelcontextprotocol/server-filesystem",
+               "/Users/dsr-ai-lab","/Users/dsr-ai-lab/projects","/tmp"]
+    },
+    "git":    { "command":"uvx","args":["mcp-server-git","--repository","/Users/dsr-ai-lab"] },
+    "memory": { "command":"npx","args":["-y","@modelcontextprotocol/server-memory"],
+                "env":{"MEMORY_FILE_PATH":"/Users/dsr-ai-lab/.tier-enforcer/memory-graph.json"} },
+    "github": { "command":"npx","args":["-y","@modelcontextprotocol/server-github"],
+                "env":{"GITHUB_PERSONAL_ACCESS_TOKEN":"SET_YOUR_GITHUB_TOKEN"} },
+    "gdrive": { "command":"npx","args":["-y","@modelcontextprotocol/server-gdrive"],
+                "env":{"GDRIVE_CLIENT_ID":"SET","GDRIVE_CLIENT_SECRET":"SET",
+                       "GDRIVE_REDIRECT_URI":"http://localhost:3000/oauth2callback"} },
+    "intent-mcp":          { "command":"python3","args":["/Users/dsr-ai-lab/intent-mcp/server.py"] },
+    "arch-mcp":            { "command":"python3","args":["/Users/dsr-ai-lab/arch-mcp/server.py"] },
+    "coding-mcp":          { "command":"python3","args":["/Users/dsr-ai-lab/coding-mcp/server.py"] },
+    "rca-mcp":             { "command":"python3","args":["/Users/dsr-ai-lab/rca-mcp/server.py"] },
+    "integration-mcp":     { "command":"python3","args":["/Users/dsr-ai-lab/integration-mcp/server.py"] },
+    "aidev-mcp":           { "command":"python3","args":["/Users/dsr-ai-lab/aidev-mcp/server.py"] },
+    "math-mcp":            { "command":"python3","args":["/Users/dsr-ai-lab/math-mcp/server.py"] },
+    "budget-mcp":          { "command":"python3","args":["/Users/dsr-ai-lab/budget-mcp/server.py"] },
+    "context-mcp":         { "command":"python3","args":["/Users/dsr-ai-lab/context-mcp/server.py"] },
+    "rpa-mcp":             { "command":"python3","args":["/Users/dsr-ai-lab/rpa-mcp/server.py"] },
+    "mobile-dev-mcp":      { "command":"python3","args":["/Users/dsr-ai-lab/mobile-dev-mcp/server.py"] },
+    "webmobile-dev-mcp":   { "command":"python3","args":["/Users/dsr-ai-lab/webmobile-dev-mcp/server.py"] },
+    "website-dev-mcp":     { "command":"python3","args":["/Users/dsr-ai-lab/website-dev-mcp/server.py"] },
+    "ecommerce-mcp":       { "command":"python3","args":["/Users/dsr-ai-lab/ecommerce-mcp/server.py"] },
+    "mac-automation-mcp":  { "command":"python3","args":["/Users/dsr-ai-lab/mac-automation-mcp/server.py"] },
+    "files-automation-mcp":{ "command":"python3","args":["/Users/dsr-ai-lab/files-automation-mcp/server.py"] }
+  }
+}

@@ -1,12 +1,18 @@
-# DSR AI-Lab Tier Routing v9 — Architecture
+# DSR AI-Lab Tier Routing v9.1 — Architecture
 
-**Version:** v9 | **Date:** 2026-03-22 | **Repo:** Claude-Tier-MacMini
+**Version:** v9.1 | **Date:** 2026-03-22 | **Repo:** Claude-Tier-MacMini
 
 ---
 
 ## System Overview
 
-DSR AI-Lab Tier Routing is a dual-MCP AI orchestration system. Claude acts as **Brain only** — it classifies, plans, and routes. Ollama T1 models execute all code, file writes, and bash commands. T2 models (Gemini/Kimi) provide analysis that enriches T1 prompts — they never execute directly.
+DSR AI-Lab Tier Routing is a production AI orchestration system for Claude CLI on Mac Mini.
+Claude acts as **Brain only** — classifies, plans, routes. Ollama T1 models execute all code
+and file writes. T2 models (Gemini / Kimi) analyze and enrich prompts — they never execute.
+
+Every Claude session fires `startup_banner.py` which live-checks all 6 models, LangSmith,
+LangGraph, TierEnforcer DB, 22 MCP servers, and 12 Skills in parallel — auto-prewarming
+T1-LOCAL and T1-MID in background.
 
 ---
 
@@ -14,36 +20,79 @@ DSR AI-Lab Tier Routing is a dual-MCP AI orchestration system. Claude acts as **
 
 ```mermaid
 graph TD
-    User([User Task]) --> ClaudeBrain[Claude CLI<br/>Brain Only<br/>Bash/Edit/Write DISABLED]
+    User([User Task]) --> ClaudeBrain
 
-    ClaudeBrain --> TierEnforcer[tier-enforcer-mcp<br/>Python / FastMCP 3.1.0<br/>LangGraph 8 Nodes]
-    ClaudeBrain --> TierRouter[tier-router-mcp<br/>TypeScript / Node 20+<br/>18 MCP Tools]
+    subgraph ClaudeBrain["Claude CLI — Brain Only"]
+        SH[SessionStart Hook<br/>startup_banner.py<br/>Live checks + auto-prewarm]
+        PH[PreToolUse Hook<br/>intercept.py<br/>Edit/Write → Ollama]
+        TE[tier-enforcer-mcp<br/>FastMCP 3.1.0 · Python<br/>LangGraph 8 nodes]
+        SH -.->|fires on start| TE
+        PH -->|file ops| TE
+    end
 
-    TierEnforcer --> T1L[T1-LOCAL<br/>qwen2.5-coder:7b<br/>Ollama local 4.7GB]
-    TierEnforcer --> T1M[T1-MID<br/>qwen2.5-coder:14b<br/>Ollama local 9.0GB]
-    TierEnforcer --> T1C[T1-CLOUD<br/>qwen3-coder:480b-cloud<br/>Ollama cloud]
-    TierEnforcer --> T2F[T2-FLASH<br/>gemini-2.5-flash<br/>Analysis only]
-    TierEnforcer --> T2P[T2-PRO<br/>gemini-2.5-pro<br/>Analysis only]
-    TierEnforcer --> T2K[T2-KIMI<br/>Kimi-K2-Instruct<br/>Analysis only]
+    TE --> T1L[T1-LOCAL<br/>qwen2.5-coder:7b<br/>4.7GB · localhost]
+    TE --> T1M[T1-MID<br/>qwen2.5-coder:14b<br/>9.0GB · localhost]
+    TE --> T1C[T1-CLOUD<br/>qwen3-coder:480b-cloud<br/>Ollama cloud]
+    TE --> T2F[T2-FLASH<br/>gemini-2.5-flash<br/>Analysis only]
+    TE --> T2P[T2-PRO<br/>gemini-2.5-pro<br/>Analysis only]
+    TE --> T2K[T2-KIMI<br/>Kimi-K2-Instruct<br/>HF API · Pro]
 
     T2F -->|enriched prompt| T1M
     T2P -->|enriched prompt| T1M
     T2K -->|enriched prompt| T1M
 
-    TierRouter --> T1L
-    TierRouter --> T1C
-    TierRouter --> T2F
-    TierRouter --> T2P
+    TE <-->|tracing| LS[LangSmith<br/>api.smith.langchain.com<br/>project: dsr-ai-lab-tier-v9]
+    TE <-->|state machine| LG[LangGraph v1.1.3<br/>8-node pipeline]
 
-    style ClaudeBrain fill:#4a4a8a,color:#fff
-    style TierEnforcer fill:#2d6a4f,color:#fff
-    style TierRouter fill:#1d3557,color:#fff
+    style ClaudeBrain fill:#1a1a2e,color:#fff
     style T1L fill:#457b9d,color:#fff
     style T1M fill:#457b9d,color:#fff
     style T1C fill:#e63946,color:#fff
     style T2F fill:#f4a261,color:#000
     style T2P fill:#f4a261,color:#000
     style T2K fill:#f4a261,color:#000
+    style LS fill:#2d6a4f,color:#fff
+    style LG fill:#2d6a4f,color:#fff
+```
+
+---
+
+## Startup Banner Flow
+
+```mermaid
+sequenceDiagram
+    participant SH as SessionStart Hook
+    participant BP as startup_banner.py
+    participant OL as Ollama /api/ps + /api/tags
+    participant GE as gemini --version
+    participant HF as HF /api/whoami-v2
+    participant LS as LangSmith API
+    participant LG as LangGraph import
+    participant TE as TierEnforcer files+DB
+    participant FS as Skills + MCP scripts
+    participant RAM as Ollama RAM (prewarm bg)
+
+    SH->>BP: python3 startup_banner.py
+    BP->>OL: GET /api/tags + /api/ps (parallel)
+    BP->>GE: subprocess gemini --version (parallel)
+    BP->>HF: GET /api/whoami-v2 (parallel)
+    BP->>LS: GET api.smith.langchain.com/info (parallel)
+    BP->>LG: import langgraph.graph (parallel)
+
+    OL-->>BP: pulled=[7b,14b,480b,...] loaded=[7b,14b]
+    GE-->>BP: 0.33.0
+    HF-->>BP: {name:DSR07, isPro:true}
+    LS-->>BP: {version:0.13.32}
+    LG-->>BP: v1.1.3
+
+    BP->>TE: check intercept.py + memory.db + server.py
+    BP->>FS: check 22 MCP scripts + 12 skill .md files
+    TE-->>BP: intercept✅ DB✅(10 rows) server✅
+    FS-->>BP: 22/22 MCPs present · 12/12 skills present
+
+    BP->>RAM: Thread: prewarm 7b+14b if not in RAM (background)
+
+    BP->>SH: Print FULL LIVE BANNER (all statuses real data)
 ```
 
 ---
@@ -51,39 +100,42 @@ graph TD
 ## LangGraph State Machine (8 Nodes)
 
 ```mermaid
-flowchart LR
-    A([Task Input]) --> B[classify]
-    B --> C[skill_selector]
-    C --> D[claude_brain]
-    D --> E[prewarm_check]
+flowchart TD
+    IN([Task Input]) --> CL[classify<br/>keyword scan → tier]
+    CL --> SK[skill_selector<br/>load domain skill]
+    SK --> CB[claude_brain<br/>Claude writes execution plan<br/>runs for EVERY tier]
+    CB --> PC[prewarm_check<br/>verify T1 models in Ollama RAM]
 
-    E --> F{Route?}
-    F -->|T2 path| G[t2_analysis<br/>Gemini / Kimi]
-    F -->|T1 path| H[t1_execute<br/>Ollama]
+    PC --> RT{Route?}
+    RT -->|T2-FLASH / T2-PRO / T2-KIMI| T2[t2_analysis<br/>Gemini-flash / Gemini-pro / Kimi-K2<br/>returns structured analysis]
+    RT -->|T1-LOCAL / T1-MID / T1-CLOUD| EX
 
-    G --> H
-    H --> I[escalate]
-    I -->|score OK| J[audit]
-    I -->|score low| H
-    J --> K([END])
+    T2 -->|enriched prompt| EX[t1_execute<br/>Ollama T1 model runs task<br/>keep_alive=-1]
 
-    style A fill:#555,color:#fff
-    style K fill:#555,color:#fff
-    style D fill:#4a4a8a,color:#fff
-    style G fill:#f4a261,color:#000
-    style H fill:#457b9d,color:#fff
-    style I fill:#e63946,color:#fff
+    EX --> ES{escalate<br/>score ≥ threshold?}
+    ES -->|Yes| AU[audit<br/>write routing_log<br/>11 cols · SQLite]
+    ES -->|No - fallback| EX
+
+    AU --> OUT([Result])
+
+    style IN fill:#555,color:#fff
+    style OUT fill:#555,color:#fff
+    style CB fill:#4a4a8a,color:#fff
+    style T2 fill:#f4a261,color:#000
+    style EX fill:#457b9d,color:#fff
+    style ES fill:#e63946,color:#fff
+    style AU fill:#2d6a4f,color:#fff
 ```
 
 | Node | Responsibility |
 |------|---------------|
 | `classify` | Keyword scan → assign tier (T1-LOCAL / T1-MID / T1-CLOUD / T2-FLASH / T2-PRO / T2-KIMI) |
-| `skill_selector` | Load domain skill file into context (retail-analytics, cybersecurity, etc.) |
-| `claude_brain` | Claude writes execution plan — runs for **every** tier, no exceptions |
-| `prewarm_check` | Verify 7b + 14b models are loaded in Ollama RAM |
-| `t2_analysis` | Gemini-flash / Gemini-pro / Kimi-K2 analyzes task, returns structured analysis |
-| `t1_execute` | Ollama runs task using T1 model + claude_brain plan + optional T2 analysis |
-| `escalate` | If quality score < threshold → bump to next tier (max 2 fallbacks) |
+| `skill_selector` | Load matching skill `.md` file into context from `~/.claude/skills/` |
+| `claude_brain` | Claude writes step-by-step execution plan — runs for **every** tier |
+| `prewarm_check` | Verify 7b + 14b are in Ollama RAM; load if cold |
+| `t2_analysis` | Gemini-flash / Gemini-pro / Kimi-K2 analyzes task → returns structured brief |
+| `t1_execute` | Ollama runs task with brain plan + optional T2 analysis (`keep_alive=-1`) |
+| `escalate` | Score < threshold → bump to next tier (max 2 fallbacks) |
 | `audit` | Write row to `routing_log` (11 cols: ts, session, task, classified_tier, executor_tier, model, score, ok, elapsed, skills, brain_used) |
 
 ---
@@ -92,21 +144,21 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    Task([Incoming Task]) --> KW{Keyword Scan}
+    Task([Incoming Task]) --> KW{Keyword Scan<br/>priority order}
 
-    KW -->|debug / error / failing / broken / traceback| TF[T2-FLASH]
-    KW -->|analyze / explain / review / assess| TP[T2-PRO]
-    KW -->|reason / infer / logic / deduce| TK[T2-KIMI]
-    KW -->|greenfield / epic / full platform / complete system| TC[T1-CLOUD]
-    KW -->|moderate / write module / implement feature| TM[T1-MID]
-    KW -->|simple / rename / fix typo / utility| TL[T1-LOCAL]
+    KW -->|debug · error · failing<br/>broken · traceback| TF[T2-FLASH]
+    KW -->|analyze · explain<br/>review · audit entire| TP[T2-PRO]
+    KW -->|algorithm · math<br/>big-o · statistical| TK[T2-KIMI]
+    KW -->|full platform · greenfield<br/>complete system · end to end| TC[T1-CLOUD]
+    KW -->|implement · write module<br/>refactor · integrate| TM[T1-MID]
+    KW -->|everything else — default| TL[T1-LOCAL]
 
-    TF -->|analysis| TM2[T1-MID executes]
-    TP -->|analysis| TM2
-    TK -->|analysis| TM2
-    TC --> OC[Ollama qwen3-coder:480b-cloud]
-    TM --> OM[Ollama qwen2.5-coder:14b]
-    TL --> OL[Ollama qwen2.5-coder:7b]
+    TF -->|analysis brief| TM2[T1-MID executes<br/>qwen2.5-coder:14b]
+    TP -->|analysis brief| TM2
+    TK -->|analysis brief| TM2
+    TC --> OC[qwen3-coder:480b-cloud<br/>Ollama cloud]
+    TM --> OM[qwen2.5-coder:14b<br/>Ollama local]
+    TL --> OL[qwen2.5-coder:7b<br/>Ollama local]
 
     style TF fill:#f4a261,color:#000
     style TP fill:#f4a261,color:#000
@@ -114,6 +166,7 @@ flowchart TD
     style TC fill:#e63946,color:#fff
     style TM fill:#457b9d,color:#fff
     style TL fill:#457b9d,color:#fff
+    style TM2 fill:#457b9d,color:#fff
     style OC fill:#e63946,color:#fff
     style OM fill:#457b9d,color:#fff
     style OL fill:#457b9d,color:#fff
@@ -121,7 +174,7 @@ flowchart TD
 
 ---
 
-## Intercept / Hook Flow (Edit/Write Protection)
+## Intercept / Hook Flow
 
 ```mermaid
 sequenceDiagram
@@ -132,25 +185,28 @@ sequenceDiagram
     participant O as Ollama T1
     participant FS as File System
 
-    U->>C: Give me a task
-    C->>C: Plan with claude_brain
-    C->>H: Attempt Edit/Write/MultiEdit
+    U->>C: task request
+    C->>C: classify + claude_brain plan
+    C->>H: attempt tool call
 
-    H->>I: Intercept triggered
-    I->>I: tool_name in OLLAMA_TOOLS?
-
-    alt Bash command
-        I-->>H: continue: true (passthrough)
-        H-->>C: native execution
+    alt Bash tool
+        H-->>C: continue=true  (passthrough — native exec)
     else Edit / Write / MultiEdit / NotebookEdit
-        I->>O: POST /api/generate (task description)
-        O->>I: generated file content
-        I->>FS: Write file
-        I-->>H: continue: false (Claude blocked)
+        H->>I: intercept triggered
+        I->>I: Is path ~/.claude/ or ~/tier-enforcer-mcp/?
+        alt Internal path (passthrough)
+            I-->>H: continue=true
+        else User project file
+            I->>O: POST /api/chat (task desc, keep_alive=-1)
+            O->>I: generated content
+            I->>FS: write file
+            I-->>H: continue=false  (Claude blocked)
+        end
     end
 ```
 
-**Bash is native passthrough.** Edit/Write/MultiEdit/NotebookEdit always go through Ollama — Claude physically cannot write files directly.
+**Bash is always native.** Internal paths (`~/.claude/`, `~/tier-enforcer-mcp/`) passthrough.
+All user project file writes go through Ollama — Claude physically cannot write them.
 
 ---
 
@@ -158,12 +214,20 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-    TL[T1-LOCAL<br/>threshold 0.45] -->|score low| TM
-    TM[T1-MID<br/>threshold 0.55] -->|score low| TC
-    TC[T1-CLOUD<br/>threshold 0.60] -->|score low| TF
-    TF[T2-FLASH<br/>threshold 0.50] -->|score low| TP
-    TP[T2-PRO<br/>threshold 0.50] -->|score low| TK
-    TK[T2-KIMI<br/>threshold 0.50] -->|max fallbacks| END([Stop])
+    TL["T1-LOCAL<br/>qwen2.5-coder:7b<br/>threshold 0.45"]
+    TM["T1-MID<br/>qwen2.5-coder:14b<br/>threshold 0.55"]
+    TC["T1-CLOUD<br/>qwen3-coder:480b-cloud<br/>threshold 0.60"]
+    TF["T2-FLASH<br/>gemini-2.5-flash<br/>threshold 0.50"]
+    TP["T2-PRO<br/>gemini-2.5-pro<br/>threshold 0.50"]
+    TK["T2-KIMI<br/>Kimi-K2-Instruct<br/>threshold 0.50"]
+    END([best result])
+
+    TL -->|score low| TM
+    TM -->|score low| TC
+    TC -->|score low| TF
+    TF -->|score low| TP
+    TP -->|score low| TK
+    TK -->|max 2 fallbacks| END
 
     style TL fill:#457b9d,color:#fff
     style TM fill:#457b9d,color:#fff
@@ -173,117 +237,180 @@ flowchart LR
     style TK fill:#f4a261,color:#000
 ```
 
-Max fallbacks per task: **2**. Quality scores written to `routing_log` for every attempt.
-
 ---
 
-## Session Startup Sequence
+## Full Session Startup Sequence
 
 ```mermaid
 sequenceDiagram
-    participant T as Terminal / zshrc
-    participant O as Ollama
-    participant W as Watchdog
+    participant Z as zshrc / Login Item
+    participant OL as Ollama
     participant C as Claude CLI
     participant K as macOS Keychain
+    participant S as settings.json
+    participant BP as startup_banner.py
     participant MCP as tier-enforcer-mcp
+    participant LS as LangSmith
 
-    T->>O: GET /api/ps (are models loaded?)
-    alt Models cold
-        T->>O: POST /api/generate keep_alive=-1 (7b + 14b)
-        O-->>T: Models in RAM
-    else Models warm
-        T-->>T: Skip prewarm (guard exits)
+    Z->>OL: GET /api/ps — models loaded?
+    alt Cold
+        Z->>OL: POST /api/chat 7b keep_alive=-1 (bg)
+        Z->>OL: POST /api/chat 14b keep_alive=-1 (bg)
     end
 
-    T->>W: Start watchdog (single instance guard)
-    W->>MCP: Start server.py (FastMCP)
+    Z->>C: user runs: claude
 
-    T->>C: claude (user invokes)
-    C->>K: Read "Claude Code-credentials"
-    K-->>C: OAuth token sk-ant-oat01-...
-    C->>C: Load settings.json (22 MCP servers + hooks)
-    C->>C: Load CLAUDE.md (brain protocol v8)
+    C->>K: find "Claude Code-credentials"
+    K-->>C: OAuth sk-ant-oat01-... (claude.ai subscription)
+
+    C->>S: load settings.json
+    S-->>C: 22 MCP servers + hooks + env vars
+
+    C->>MCP: spawn server.py (stdio)
+    MCP-->>C: FastMCP ready
+
+    C->>BP: SessionStart hook fires
+    BP->>BP: parallel checks (6s max)
+    BP-->>C: FULL LIVE BANNER printed
 
     C->>MCP: activate_tier_routing(session_id)
-    MCP->>MCP: Compile LangGraph 8 nodes
-    MCP-->>C: OK — LangGraph ready
+    MCP->>MCP: compile LangGraph 8 nodes
+    MCP-->>C: LANGGRAPH_HARD mode active
 
     C->>MCP: tier_health_check(tier=ALL)
-    MCP-->>C: Tier status map
+    MCP-->>C: all tiers ONLINE
 
     C->>MCP: prewarm_models()
-    MCP->>O: Verify 7b + 14b in RAM
-    MCP-->>C: Models confirmed warm
+    MCP->>OL: verify 7b + 14b in RAM
+    MCP-->>C: models confirmed warm
 
-    C->>C: Show STARTUP BANNER (live data)
+    C->>LS: trace session start
+    LS-->>C: tracing active (project: dsr-ai-lab-tier-v9)
+
+    C-->>Z: READY — execute_task() available
 ```
 
 ---
 
-## Database Schema (`routing_log`)
+## Database Schema (`~/.tier-enforcer/memory.db`)
 
 ```sql
 CREATE TABLE routing_log (
-    ts              TEXT,       -- ISO timestamp (IST)
-    session         TEXT,       -- session UUID
-    task            TEXT,       -- task description (first 200 chars)
-    classified_tier TEXT,       -- e.g. T2-FLASH (what classifier chose)
-    executor_tier   TEXT,       -- actual executing tier (e.g. T1-MID)
-    model           TEXT,       -- model name used for execution
-    score           REAL,       -- quality score 0.0-1.0
-    ok              INTEGER,    -- 1=success, 0=failure
-    elapsed         REAL,       -- total seconds elapsed
-    skills          TEXT,       -- JSON array of matched skill names
-    brain_used      INTEGER     -- 1=claude_brain ran, 0=skipped
+    ts              REAL,   -- Unix timestamp
+    session         TEXT,   -- session UUID
+    task            TEXT,   -- task text (first 120 chars)
+    classified_tier TEXT,   -- tier classifier assigned (e.g. T2-FLASH)
+    executor_tier   TEXT,   -- tier that actually executed (e.g. T1-MID)
+    model           TEXT,   -- model name used
+    score           REAL,   -- quality score 0.0–1.0
+    ok              INTEGER,-- 1=success 0=failure
+    elapsed         REAL,   -- total seconds
+    skills          TEXT,   -- JSON array of matched skills
+    brain_used      INTEGER -- 1=claude_brain ran
 );
 ```
 
 ---
 
-## v9 vs v8 Diff
+## MCP Servers (22 total)
 
-| Aspect | v8 | v9 |
-|--------|----|----|
-| Tiers | T1-LOCAL, T1-MID, T1-CLOUD, T2-FLASH, T2-PRO, T2-KIMI, **T3-EPIC** | T1-LOCAL, T1-MID, T1-CLOUD, T2-FLASH, T2-PRO, T2-KIMI |
-| Epic routing | T3-EPIC → blueprint → T1-CLOUD | **T1-CLOUD directly** |
-| LangGraph nodes | 9 (included `t3_plan`) | **8** (`t3_plan` removed) |
-| `claude_brain` | Ran for every tier | Ran for every tier (same — T3-EPIC was redundant) |
-| `MODEL_T1_CLOUD` | `qwen3-coder:480b` | **`qwen3-coder:480b-cloud`** (fixed) |
-| `keep_alive` | 7b + 14b only | **7b + 14b + 480b-cloud** |
-| DB columns | 8 | **11** (+ elapsed, skills, brain_used) |
-| Auth | ANTHROPIC_API_KEY env var | **OAuth macOS Keychain only** |
-| Prewarm | Fires every terminal open | **Guarded: checks /api/ps first** |
-| Watchdog instances | Multiple could accumulate | **Single instance enforced** |
+```mermaid
+graph LR
+    subgraph Core
+        TE[tier-enforcer]
+        FS[filesystem]
+        GIT[git]
+        MEM[memory]
+        GH[github]
+        GD[gdrive]
+    end
+
+    subgraph Dev
+        IN[intent-mcp]
+        AR[arch-mcp]
+        CO[coding-mcp]
+        RC[rca-mcp]
+        IT[integration-mcp]
+        AI[aidev-mcp]
+        MT[math-mcp]
+    end
+
+    subgraph Domain
+        BU[budget-mcp]
+        CT[context-mcp]
+        RP[rpa-mcp]
+    end
+
+    subgraph Platform
+        MO[mobile-dev-mcp]
+        WM[webmobile-dev-mcp]
+        WS[website-dev-mcp]
+        EC[ecommerce-mcp]
+    end
+
+    subgraph Automation
+        MA[mac-automation-mcp]
+        FA[files-automation-mcp]
+    end
+
+    Claude --> Core
+    Claude --> Dev
+    Claude --> Domain
+    Claude --> Platform
+    Claude --> Automation
+```
 
 ---
 
-## Deployed Files
+## Skills (12 total, `~/.claude/skills/`)
 
-| File | Purpose |
-|------|---------|
-| `tier-enforcer/server.py` | FastMCP 3.1.0, LangGraph 8 nodes, 11-col DB |
-| `tier-enforcer/intercept.py` | PreToolUse hook — Edit/Write → Ollama |
-| `tier-enforcer/watchdog.sh` | Single-instance watchdog, auto-restart |
-| `src/core/router.ts` | TypeScript tier routing engine |
-| `src/tiers/t2-gemini.ts` | T2 Gemini tier (separate instances per model) |
-| `~/.claude/CLAUDE.md` | Brain protocol v8 — 3 startup calls, 4 banners |
-| `~/.claude/settings.json` | Hooks + 22 MCP servers |
-| `~/.zshrc` | Guarded prewarm + watchdog guard |
-| `~/.tier-enforcer/memory.db` | SQLite routing_log (11 cols) |
-
----
-
-## Constraint Summary
-
-| Rule | What it means |
-|------|--------------|
-| RULE 1 | Bash/Edit/Write/MultiEdit disabled for Claude globally |
-| RULE 2 | Every task goes through `execute_task()` MCP tool |
-| RULE 5 | Epic tasks → T1-CLOUD directly — T3-EPIC does not exist in v9 |
-| RULE 6 | T2 = analysis only; T1 = all execution |
-| RULE 7 | tier-enforcer offline → HARD STOP, Claude refuses all tasks |
+| Skill | Domain |
+|-------|--------|
+| `aiapp` | AI app development |
+| `arch` | Architecture / ADR |
+| `math` | Mathematics / algorithms |
+| `multifile` | Multi-file implementation |
+| `rca` | Root cause analysis / debugging |
+| `scope` | Task scoping |
+| `tier-audit` | Tier routing audit |
+| `tier-debug` | Tier system debugging |
+| `tier-health` | Tier health checks |
+| `tier-report` | Routing report generation |
+| `tier-reset` | Tier state reset |
+| `wire` | Wiring / integration |
 
 ---
 
-*DSR AI-Lab — Mac Mini — Architecture v9 — 2026-03-22*
+## Component Files
+
+| File | Type | Purpose |
+|------|------|---------|
+| `tier-enforcer-mcp/server.py` | Python | FastMCP 3.1.0 · LangGraph 8 nodes · SQLite audit |
+| `tier-enforcer-mcp/intercept.py` | Python | PreToolUse hook — Edit/Write → Ollama |
+| `tier-enforcer-mcp/startup_banner.py` | Python | **v9.1** — live status banner + auto-prewarm |
+| `tier-enforcer-mcp/langgraph_tier.py` | Python | LangGraph state + node definitions |
+| `dotfiles/CLAUDE.md` | Markdown | Brain protocol v9 — startup calls + tier rules |
+| `dotfiles/settings.json` | JSON | Hooks + 22 MCP servers + env vars |
+| `dotfiles/settings.local.json` | JSON | SessionStart hook → startup_banner.py |
+| `src/core/router.ts` | TypeScript | tier-router-mcp routing engine (18 tools) |
+
+---
+
+## v9 → v9.1 Architecture Changes
+
+| Aspect | v9 | v9.1 |
+|--------|----|------|
+| Startup check | Static echo banner (no real checks) | `startup_banner.py` — 9 parallel live checks |
+| Model status granularity | Binary Ollama up/down | Per-model: LIVE / READY / NOT PULLED |
+| LangSmith | Config only, not verified | Live API ping on every start |
+| LangGraph | Assumed available | Import + version verified on every start |
+| TierEnforcer health | Not shown at startup | intercept.py + DB row count + server.py |
+| MCP server health | Not verified | All 22 script paths checked |
+| Skills health | Not verified | All 12 `.md` files checked |
+| HF API endpoint | `/api/whoami` (deprecated — always 401) | `/api/whoami-v2` (correct endpoint) |
+| HF key loading | `os.environ` only (broken for hooks) | Reads `settings.json` mcpServers env directly |
+| Prewarm trigger | Only from zshrc/Login Item | Also from `startup_banner.py` background thread |
+
+---
+
+*DSR AI-Lab — Mac Mini — Architecture v9.1 — 2026-03-22*
